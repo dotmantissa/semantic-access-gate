@@ -1,0 +1,18 @@
+[project]
+name = "semantic-access-gate"
+version = "1.0.0"
+description = "Semantic Access Gate: GenLayer primitive that enforces natural language access policies through validator consensus"
+requires-python = ">=3.10"
+
+[project.dependencies]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+markers = [
+    "live: tests that execute against the deployed StudioNet contract",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
