@@ -35,6 +35,24 @@ from datetime import datetime, timezone
 from genlayer import *
 
 
+def _as_address(value: typing.Any) -> Address:
+    """
+    Normalize an address argument to an Address.
+
+    Constructor arguments arrive as whatever the deploying client encoded. A hex
+    string is a perfectly reasonable thing for a deploy script to pass, and it must
+    not be written into an Address storage slot untouched: the slot writer asks the
+    value for its bytes and a str has none, which fails the whole deployment with an
+    attribute error rather than a usable message.
+    """
+    if isinstance(value, Address):
+        return value
+    try:
+        return Address(value)
+    except Exception:
+        raise gl.vm.UserError("[EXPECTED] Value is not a valid address")
+
+
 @allow_storage
 @dataclass
 class Listing:
@@ -61,9 +79,9 @@ class GatedConsumer(gl.Contract):
     def __init__(
         self, gate_registry: Address, gate_id: str, expected_gate_owner: Address
     ) -> None:
-        self.gate_registry = gate_registry
+        self.gate_registry = _as_address(gate_registry)
         self.gate_id = gate_id.strip().lower()
-        self.expected_gate_owner = expected_gate_owner
+        self.expected_gate_owner = _as_address(expected_gate_owner)
         self.deployer = gl.message.sender_address
         self.listing_count = u32(0)
 
@@ -157,7 +175,7 @@ class GatedConsumer(gl.Contract):
     @gl.public.view
     def can_publish(self, subject: Address) -> bool:
         """Front end pre-flight. Proxies straight through to the gate."""
-        return self._gate_says_approved(subject)
+        return self._gate_says_approved(_as_address(subject))
 
     @gl.public.view
     def verify_gate_owner(self) -> str:

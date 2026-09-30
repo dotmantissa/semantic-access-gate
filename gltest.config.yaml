@@ -7,6 +7,8 @@ networks:
 
 paths:
   contracts: "contracts"
-  artifacts: "artifacts"
+  # The test plugin clears this directory at the start of every session, so the
+  # deployment record lives in deployments/ instead and is never wiped by a test run.
+  artifacts: ".gltest-artifacts"
 
 environment: ".env"

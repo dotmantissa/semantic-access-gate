@@ -1,0 +1,14 @@
+{
+  "chainId": "61999",
+  "consumerAddress": "0xE31855910183e00b69906435EA956CAd0679F61C",
+  "consumerBoundGateId": "licensed-medical-pro",
+  "consumerContractName": "GatedConsumer",
+  "consumerDeploymentTransaction": "0x6250d16f871b095d8536ed708585f7a9103c59d590afaaa1a776c3dc6286e996",
+  "deployerAddress": "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53",
+  "network": "studionet",
+  "registryAddress": "0xA21f00DdEDb898e0e10575DCF46B4e2E856E7a5b",
+  "registryContractName": "SemanticAccessGate",
+  "registryDeploymentTransaction": "0x2d2053993c66a7d3270c1321981df252f496cc29fb583b17504dc1cda1a77469",
+  "rpc": "https://studio.genlayer.com/api",
+  "runner": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6"
+}
