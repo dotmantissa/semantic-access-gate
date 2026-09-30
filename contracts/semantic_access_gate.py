@@ -342,6 +342,23 @@ def _host_allowed(host: str, allowed_hosts: list) -> bool:
     return False
 
 
+def _as_address(value: typing.Any) -> Address:
+    """
+    Normalize an address argument to an Address.
+
+    Calldata decoding hands methods an Address, but a caller inside the VM can pass
+    the raw 20 bytes, and the ABI boundary is not the place to raise an opaque
+    AttributeError. Coercing once at method entry means every path downstream, the
+    composite storage keys included, sees one representation.
+    """
+    if isinstance(value, Address):
+        return value
+    try:
+        return Address(value)
+    except Exception:
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} Value is not a valid address")
+
+
 def _binding_token(gate_id: str, applicant_hex: str) -> str:
     """
     Build the proof-of-control token an applicant must publish on their evidence.
@@ -1007,8 +1024,8 @@ class SemanticAccessGate(gl.Contract):
             f"{ERROR_EXPECTED} Only the gate owner can perform this action",
         )
 
-    def _access_key(self, gate_id: str, holder: Address) -> str:
-        return gate_id + KEY_SEP + holder.as_hex.lower()
+    def _access_key(self, gate_id: str, holder: typing.Any) -> str:
+        return gate_id + KEY_SEP + _as_address(holder).as_hex.lower()
 
     def _parse_json_list(self, raw: str, label: str) -> list:
         try:
@@ -1420,11 +1437,12 @@ class SemanticAccessGate(gl.Contract):
         """Hand a gate to a new owner, for example a DAO or multisig."""
         gate = self._gate_or_raise(gate_id.strip().lower())
         self._require_gate_owner(gate)
+        owner = _as_address(new_owner)
         self._require(
-            new_owner.as_hex.lower() != "0x" + "0" * 40,
+            owner.as_hex.lower() != "0x" + "0" * 40,
             f"{ERROR_EXPECTED} new_owner cannot be the zero address",
         )
-        gate.owner = new_owner
+        gate.owner = owner
         gate.updated_at = self._now()
         self.gates[gate.gate_id] = gate
 
@@ -2125,6 +2143,7 @@ class SemanticAccessGate(gl.Contract):
         `reason` is a stable machine readable code.
         """
         gid = gate_id.strip().lower()
+        subject = _as_address(subject)
         gate = self.gates.get(gid)
         if gate is None:
             return json.dumps(
@@ -2194,7 +2213,7 @@ class SemanticAccessGate(gl.Contract):
         the applicant's own address, so it proves control of that address rather than
         merely pointing at a document about someone.
         """
-        return _binding_token(gate_id.strip().lower(), subject.as_hex)
+        return _binding_token(gate_id.strip().lower(), _as_address(subject).as_hex)
 
     @gl.public.view
     def can_apply(self, gate_id: str, subject: Address) -> str:
@@ -2205,6 +2224,7 @@ class SemanticAccessGate(gl.Contract):
         the caller must attach.
         """
         gid = gate_id.strip().lower()
+        subject = _as_address(subject)
         gate = self.gates.get(gid)
         if gate is None:
             return json.dumps(
@@ -2492,6 +2512,7 @@ class SemanticAccessGate(gl.Contract):
         self, applicant: Address, offset: int, limit: int
     ) -> str:
         """Paginated list of every application filed by one address across all gates."""
+        applicant = _as_address(applicant)
         total = int(self.applicant_application_count.get(applicant) or 0)
         start = max(0, int(offset))
         count = max(0, min(int(limit), 100))
