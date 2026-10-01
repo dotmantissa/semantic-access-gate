@@ -34,8 +34,18 @@ from genlayer_py.chains import studionet
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 ARTIFACT = ROOT / "deployments" / "studionet.json"
 
-DEPLOYER_KEY = "${GENLAYER_DEPLOYER_KEY}"
-SECOND_KEY = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+# Keys come from the environment and are deliberately absent from the source. The live
+# suite acts as the gate owner, so it needs a funded account; without the variable set the
+# whole directory skips rather than failing with a confusing signing error.
+#
+# GENLAYER_DEPLOYER_KEY  the account that owns the gates, required
+# GENLAYER_SECOND_KEY    a second identity for the non owner and impersonation tests,
+#                        defaulting to a well known public development key
+DEPLOYER_KEY = os.environ.get("GENLAYER_DEPLOYER_KEY", "").strip()
+SECOND_KEY = os.environ.get(
+    "GENLAYER_SECOND_KEY",
+    "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d",
+).strip()
 
 RPC_URL = "https://studio.genlayer.com/api"
 USER_AGENT = "semantic-access-gate-tests/1.0"
@@ -307,6 +317,10 @@ def consumer_address(deployment):
 
 @pytest.fixture(scope="session")
 def owner_account():
+    if not DEPLOYER_KEY:
+        pytest.skip(
+            "set GENLAYER_DEPLOYER_KEY to a funded StudioNet account to run the live suite"
+        )
     return create_account(DEPLOYER_KEY)
 
 

@@ -10,7 +10,9 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -23,8 +25,12 @@ REGISTRY_SOURCE = ROOT / "contracts" / "semantic_access_gate.py"
 CONSUMER_SOURCE = ROOT / "tests" / "fixtures" / "gated_consumer.py"
 ARTIFACT = ROOT / "deployments" / "studionet.json"
 
-DEPLOYER_KEY = "${GENLAYER_DEPLOYER_KEY}"
 RUNNER = "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6"
+
+# The deploying key is read from the environment and is deliberately not in the source.
+# A key committed to a repository is a key that has been published, whichever network it
+# happens to fund.
+DEPLOYER_KEY_VAR = "GENLAYER_DEPLOYER_KEY"
 
 
 def deploy(client, source: pathlib.Path, args: list, label: str) -> str:
@@ -55,7 +61,16 @@ def main() -> int:
     )
     opts = parser.parse_args()
 
-    account = create_account(DEPLOYER_KEY)
+    key = os.environ.get(DEPLOYER_KEY_VAR, "").strip()
+    if not key:
+        raise SystemExit(
+            f"Set {DEPLOYER_KEY_VAR} to the deploying account's private key, for example:\n"
+            f"  export {DEPLOYER_KEY_VAR}=0x...\n"
+            "Fund the account on StudioNet with the sim_fundAccount RPC method if its "
+            "balance is zero."
+        )
+
+    account = create_account(key)
     client = create_client(chain=studionet, account=account)
     balance = client.get_balance(account.address)
     print(f"deployer {account.address} balance {balance}", flush=True)
@@ -100,6 +115,10 @@ def main() -> int:
         "consumerDeploymentTransaction": consumer_tx,
         "consumerBoundGateId": opts.gate_id,
         "schemaMethods": methods,
+        # So a reviewer can confirm the deployed contracts were built from the sources in
+        # this repository rather than from something else.
+        "registrySourceSha256": hashlib.sha256(REGISTRY_SOURCE.read_bytes()).hexdigest(),
+        "consumerSourceSha256": hashlib.sha256(CONSUMER_SOURCE.read_bytes()).hexdigest(),
     }
     ARTIFACT.parent.mkdir(parents=True, exist_ok=True)
     ARTIFACT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

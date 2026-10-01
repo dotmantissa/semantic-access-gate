@@ -83,10 +83,14 @@ boolean with the policy version you saw and re-check when the version moves. Rea
 
 ```python
 import json
+import os
 from genlayer_py import create_account, create_client
 from genlayer_py.chains import studionet
 
-client = create_client(chain=studionet, account=create_account(PRIVATE_KEY))
+client = create_client(
+    chain=studionet,
+    account=create_account(os.environ["GENLAYER_DEPLOYER_KEY"]),
+)
 
 conditions = [
     {
@@ -353,9 +357,9 @@ status = json.loads(
 )
 ```
 
-Views return JSON strings, and return an empty string for an object that does not exist,
-so a read never reverts on a missing record. `genlayer-js` exposes the same methods for
-front ends.
+`is_approved` and `evidence_host_allowed` return booleans. Every other view returns a JSON
+string, and returns an empty string for an object that does not exist, so a read never
+reverts on a missing record. `genlayer-js` exposes the same methods for front ends.
 
 Useful reads for an operator dashboard:
 

@@ -17,6 +17,13 @@ Live on the GenLayer Studio network:
 | Example consumer | [`0xE31855910183e00b69906435EA956CAd0679F61C`](https://explorer-studio.genlayer.com/address/0xE31855910183e00b69906435EA956CAd0679F61C) |
 | Runner | `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` |
 
+`deployments/studionet.json` records the addresses, the deployment transactions and a
+sha256 of each contract source, so the deployment can be checked against this repository:
+
+```bash
+sha256sum contracts/semantic_access_gate.py tests/fixtures/gated_consumer.py
+```
+
 ## The problem
 
 Smart contract access control is deterministic. You hold a token, or you are on a list,
@@ -241,18 +248,20 @@ gate owner cannot rescue a holder by revoking first and returning the deposit.
 `get_challenge`, `list_gates`, `list_applications`, `list_holders`,
 `get_applicant_applications`, `gate_stats`, `get_registry_stats`
 
-Views return JSON strings, and return an empty string for objects that do not exist so a
-front end never has to catch a revert on a read.
+`is_approved` and `evidence_host_allowed` return booleans. Every other view returns a JSON
+string, and returns an empty string for an object that does not exist, so a front end never
+has to catch a revert on a read. A view on an unknown gate fails closed: `is_approved`
+returns false rather than raising.
 
 ## Tests
 
-423 tests across three layers. Every one of them runs against the code that ships.
+409 tests across three layers. Every one of them runs against the code that ships.
 
 | Suite | Count | What it establishes |
 |---|---|---|
 | `tests/unit` | 140 | The consensus critical pure functions, driven directly |
 | `tests/direct` | 234 | The whole contract inside the GenVM |
-| `tests/live` | 49 | The deployed contract on StudioNet |
+| `tests/live` | 35 | The deployed contract on StudioNet |
 
 **Unit.** Direct mode executes the leader function only, so the validator half of a
 consensus round cannot be reached there. These tests import the shipped contract module
@@ -275,11 +284,17 @@ scenario that interleaves every path across two gates and six addresses.
 **Live.** Real adjudications on StudioNet. Real validators fetch a real public document
 over HTTPS, prompt real models, and consensus really has to agree. The suite proves a
 grant on a real world document, a denial of the same document under a different policy,
-the binding token path in both directions, a dead link resolving to a denial rather than
-an error, and the full composability story: an address is granted access, is admitted by
-a separately deployed consumer contract, loses that admission the moment the gate owner
-changes the policy, and regains it when the policy is restored and the evidence is
-re-adjudicated.
+the binding token path in both directions including an impersonation attempt, a dead link
+resolving to a denial rather than an error, and the full composability story: an address is
+granted access, is admitted by a separately deployed consumer contract, loses that
+admission the moment the gate owner changes the policy, and regains it when the policy is
+restored and the evidence is re-adjudicated.
+
+The live suite is deliberately a subset of the deterministic checks rather than a copy of
+them. Every validation branch is already exercised against the same code inside the real
+GenVM, and the Studio network enforces a request budget that receipt polling consumes
+quickly, so re-running the whole validation matrix live would spend that budget without
+adding signal.
 
 ### Running them
 
@@ -288,8 +303,18 @@ python -m venv .venv && . .venv/bin/activate
 pip install genlayer-test genlayer-py pytest cloudpickle
 
 pytest tests/unit tests/direct      # no network required
-pytest tests/live                   # requires a funded deployer on StudioNet
+
+export GENLAYER_DEPLOYER_KEY=0x...  # a funded StudioNet account that owns the gates
+pytest tests/live
 ```
+
+The live suite skips entirely when `GENLAYER_DEPLOYER_KEY` is unset. No private key
+appears anywhere in this repository or its history. Fund a StudioNet account with the
+`sim_fundAccount` RPC method if its balance is zero.
+
+Python 3.12 or newer is required for `tests/direct` and `tests/live`, because the current
+`genlayer-test` release and the GenLayer SDK both use PEP 695 generics. `tests/unit` runs
+on 3.10 and above.
 
 Linting requires Python 3.12 or newer, because the GenLayer SDK uses PEP 695 generics:
 
@@ -301,6 +326,8 @@ genvm-lint check contracts/semantic_access_gate.py
 ## Deployment
 
 ```bash
+export GENLAYER_DEPLOYER_KEY=0x...
+
 python scripts/deploy.py                      # registry and example consumer
 python scripts/deploy.py --registry 0x...     # consumer only, against an existing registry
 ```
