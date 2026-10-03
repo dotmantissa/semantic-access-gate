@@ -13,8 +13,8 @@ Live on the GenLayer Studio network:
 
 | | |
 |---|---|
-| Registry | [`0xA21f00DdEDb898e0e10575DCF46B4e2E856E7a5b`](https://explorer-studio.genlayer.com/address/0xA21f00DdEDb898e0e10575DCF46B4e2E856E7a5b) |
-| Example consumer | [`0xE31855910183e00b69906435EA956CAd0679F61C`](https://explorer-studio.genlayer.com/address/0xE31855910183e00b69906435EA956CAd0679F61C) |
+| Registry | [`0xE40dfb2befa0c643665568772C34eaaE852F9F62`](https://explorer-studio.genlayer.com/address/0xE40dfb2befa0c643665568772C34eaaE852F9F62) |
+| Example consumer | [`0x65cA947f97175219f8c9692F1893864C019BF54A`](https://explorer-studio.genlayer.com/address/0x65cA947f97175219f8c9692F1893864C019BF54A) |
 | Runner | `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` |
 
 `deployments/studionet.json` records the addresses, the deployment transactions and a
@@ -59,7 +59,8 @@ The registry is permissionless. Anyone can register a gate. A gate is:
 An applicant submits one to four HTTPS URLs and the bond. Adjudication is a public
 action that anyone can trigger. Validators fetch the documents, adjudicate every
 condition independently, and the contract reduces their findings to a decision. A grant
-produces an access record stamped with the gate's current policy version and an expiry.
+produces an access record stamped with the gate's current eligibility versions and an
+expiry.
 
 The gate owner never approves anyone. There is no method that grants access directly.
 The evidence and the policy do all the work.
@@ -164,30 +165,62 @@ A transient fault reverts the transaction with no state change, so the bond is u
 and the adjudication can simply be retried. A model fault rotates the leader rather than
 writing a malformed verdict to chain.
 
-## Policy versioning
+## Versioning the eligibility rules
 
-Each gate carries a `policy_version`. Every access record is stamped with the version in
-force when it was issued. `is_approved` returns true only when the record's stamp equals
-the gate's current version.
+A gate's eligibility rules are not only its prose. Four mechanical settings decide who
+qualifies just as directly as the conditions do: which hosts count as evidence, how that
+evidence is fetched, whether the applicant must prove control of the wallet, and whether
+a claim of compliance must be quotable from the fetched bytes. Relaxing the last two
+removes the only deterministic checks standing between a document and a grant, so they
+are versioned exactly as the policy text is.
 
-`update_policy` increments the version. That single write invalidates every outstanding
-access record at once. No loop over holders, no per record write, no migration, and no
-gas cost proportional to the number of holders. A gate serving ten thousand addresses is
-revised as cheaply as one serving three.
+Each gate therefore carries two counters:
 
-Invalidation rewrites nothing. The record stays `ACTIVE` with its old version stamp, so
-the reason for the refusal stays legible: `access_status` reports
-`POLICY_SUPERSEDED` and names both versions. Holders must reapply and be re-adjudicated
-against the new text.
+| Counter | Bumped by | Means |
+|---|---|---|
+| `policy_version` | `update_policy` | what the gate requires |
+| `rules_version` | `update_gate_config`, and only when one of the four adjudication-relevant settings actually changes | how the gate checks it |
 
-Mechanical settings are separated from the policy for this reason. `update_gate_config`
-changes the bond, the lifetime, the evidence hosts, the fetch mode and the cooldown
-without bumping the version, because none of those change what the policy requires.
-Changing what the policy requires always invalidates.
+Repricing a bond, extending a TTL or changing the cooldown moves neither counter, so a
+gate can be repriced without revoking its holders. The comparison is made against the
+canonicalized stored form, so reordering a host list is correctly a no-op rather than a
+mass revocation.
 
-An application filed under one version and adjudicated after an update is closed as
-`SUPERSEDED` and refunded in full, rather than judged against conditions its applicant
-never saw. This path performs no fetch and no model call.
+Together the pair names one immutable **rules snapshot**, published on registration and
+on every bump and never rewritten afterwards. `get_rules(gate_id, policy_version,
+rules_version)` reads any of them back, which answers the question an auditor actually
+has about a past decision: not what the gate requires now, but what it required when the
+application was filed. Three guarantees follow, each in O(1):
+
+**Existing grants are invalidated when either version moves.** `is_approved` compares
+both stamps against the gate's current pair. That single write invalidates every
+outstanding record at once — no loop over holders, no per record write, no migration, and
+no gas cost proportional to the number of holders. A gate serving ten thousand addresses
+is revised as cheaply as one serving three. Invalidation rewrites nothing: the record
+stays `ACTIVE` with its old stamps, so the refusal stays legible. `access_status` reports
+`POLICY_SUPERSEDED` or `RULES_SUPERSEDED` and names both pairs, and the holder's deposit
+is still fully reclaimable through `release_access`.
+
+**Pending applications cannot be judged under rules that moved.** Adjudication reads the
+frame from the snapshot the application stamped, never from the live gate, and an
+application whose gate has moved past either version closes as `SUPERSEDED` with a full
+bond refund — no fetch, no model call. The owner has no write path to a published
+snapshot, so no sequence of owner actions can judge a posted bond under rules it did not
+agree to, in either direction: no tightening to seize an honest applicant's bond, and no
+relaxing to let unqualified evidence through. The second direction is the security case
+rather than a fairness one. Switching wallet binding and quote grounding off after a bond
+is posted would otherwise let evidence carrying someone else's binding token, with quotes
+appearing nowhere in the page, be adjudicated into a live grant — making the gate owner
+able to grant access, which is the one thing this contract exists to prevent.
+
+**Open challenges are not settled under rules that moved.** A challenge pins the record
+and the version pair it was filed against. If any of the three has moved by the time it
+resolves, it closes as `VOID` with the stake returned in full, because neither the
+holder's deposit nor the challenger's stake was posted against the new frame.
+
+The host allowlist is an adjudication rule, not merely an intake filter. A URL outside
+the frozen frame's allowlist is marked inadmissible and never fetched, and the denial
+carries its own code, `EVIDENCE_HOST_NOT_ALLOWED`.
 
 ## Crypto-economics
 
@@ -195,11 +228,13 @@ never saw. This path performs no fetch and no model call.
 |---|---|---|
 | Granted | Becomes the record's deposit | |
 | Denied | Forfeited to the gate treasury | |
-| Superseded by a policy change | Refunded in full | |
+| Superseded by a policy or rules change | Refunded in full | |
 | Unadjudicated for seven days | Reclaimable by the applicant | |
 | Access released or revoked | Deposit returned | |
+| Granted again over a lapsed record | Replaced record's deposit refunded in the same transaction | |
 | Challenge upheld | Deposit slashed, half to the challenger | Returned plus half the deposit |
 | Challenge rejected | Deposit retained, half the stake as compensation | Slashed |
+| Challenge voided by a rules change | Deposit untouched | Returned in full |
 
 Denials cost money, so spamming a gate with unqualified applications is expensive while
 honest applicants are left whole. A challenge is profitable only when it is correct.
@@ -208,10 +243,22 @@ Revocation by the gate owner returns the deposit, because revocation reflects ne
 information rather than a finding that the applicant lied. Punishing fraud is what
 `challenge_access` is for.
 
-Two paths exist so that money is never stranded. `claim_stale_application` lets an
+Three paths exist so that money is never stranded. `claim_stale_application` lets an
 applicant recover a bond nobody adjudicated after seven days, which is longer than any
 plausible adjudication delay and so cannot be used to dodge an unfavourable verdict.
 There is no arbitrary withdrawal.
+
+A renewal settles the record it replaces. An access record lives at one slot per gate and
+holder, so a holder whose record has lapsed — by expiry, or because a version bump
+invalidated it — is granted into that same slot, and the record being replaced is still
+`ACTIVE` and still holding the deposit that backed it. Writing over it would leave that
+deposit inside `locked_wei` with no record pointing at it and no method able to reach it.
+The grant therefore closes the prior record as `RENEWED`, archives it, and refunds its
+deposit in the same transaction, reducing `locked_wei` by exactly the amount refunded.
+The replaced record is preserved rather than destroyed and stays readable through
+`get_access_history`, so the full sequence of grants an address has held remains
+auditable. The refund is a refund and not a carry forward, so a renewed record holds
+exactly one bond and the challenge payouts that split a deposit stay correct.
 
 The contract tracks `locked_wei`, which is bonds on pending applications plus deposits
 behind live records plus open challenge stakes, separately from `treasury_wei`, which is
@@ -225,12 +272,13 @@ evidence plus the challenger's new evidence, judged against the gate's current p
 
 Filing a challenge does not suspend access. Suspending on an unproven accusation would
 make challenges a cheap denial of service against holders. What filing does do is lock
-the record: a holder cannot release their collateral and walk away mid challenge, and the
-gate owner cannot rescue a holder by revoking first and returning the deposit.
+the record: a holder cannot release their collateral and walk away mid challenge, the
+gate owner cannot rescue a holder by revoking first and returning the deposit, and the
+holder cannot let the record lapse and renew it out from under the open challenge.
 
 ## Method surface
 
-29 methods, 13 write and 16 view.
+31 methods, 13 write and 18 view.
 
 **Gate management:** `register_gate`, `update_policy`, `update_gate_config`,
 `set_gate_paused`, `transfer_gate_ownership`, `withdraw_treasury`
@@ -244,9 +292,10 @@ gate owner cannot rescue a holder by revoking first and returning the deposit.
 **Composability:** `is_approved`, `access_status`, `binding_token`, `can_apply`,
 `evidence_host_allowed`
 
-**Reads:** `get_gate`, `get_policy`, `get_application`, `get_access_record`,
-`get_challenge`, `list_gates`, `list_applications`, `list_holders`,
-`get_applicant_applications`, `gate_stats`, `get_registry_stats`
+**Reads:** `get_gate`, `get_policy`, `get_rules`, `get_application`,
+`get_access_record`, `get_access_history`, `get_challenge`, `list_gates`,
+`list_applications`, `list_holders`, `get_applicant_applications`, `gate_stats`,
+`get_registry_stats`
 
 `is_approved` and `evidence_host_allowed` return booleans. Every other view returns a JSON
 string, and returns an empty string for an object that does not exist, so a front end never
@@ -255,13 +304,17 @@ returns false rather than raising.
 
 ## Tests
 
-409 tests across three layers. Every one of them runs against the code that ships.
+503 tests across three layers. Every one of them runs against the code that ships.
 
 | Suite | Count | What it establishes |
 |---|---|---|
-| `tests/unit` | 140 | The consensus critical pure functions, driven directly |
-| `tests/direct` | 234 | The whole contract inside the GenVM |
-| `tests/live` | 35 | The deployed contract on StudioNet |
+| `tests/unit` | 156 | The consensus critical pure functions, driven directly |
+| `tests/direct` | 308 | The whole contract inside the GenVM |
+| `tests/live` | 39 | The deployed contract on StudioNet |
+
+`tests/unit` and `tests/direct` must be run as two separate commands. Both directories
+carry a `conftest.py` and the direct suites import theirs by module name, so collecting
+both at once shadows it.
 
 **Unit.** Direct mode executes the leader function only, so the validator half of a
 consensus round cannot be reached there. These tests import the shipped contract module
@@ -271,15 +324,27 @@ pattern, the AND reduction property, host allowlist bypass attempts including su
 lookalike domains, binding token address separation, model response parsing, HTTP status
 classification, quote grounding, and the three validator rules including a leader that
 forges a grant, a leader that forges a denial, and an audit trail that contradicts its
-own decision.
+own decision. It also pins the evidence admissibility branch, which the frozen frame
+makes unreachable from outside the contract and which is therefore exactly the kind of
+defence in depth that rots untested.
 
 **Direct.** The real contract inside the real GenVM, with only the evidence fetch and the
 model call substituted. The validator closures are replayed through the harness, so the
 rules are exercised as shipped. This layer covers registration and validation, intake
-and bonds, every denial reason, policy invalidation across six holders at once, TTL
-expiry, release, revocation, both challenge settlements, and an accounting audit that
-recomputes the registry totals by walking the stored records after every step of a
-scenario that interleaves every path across two gates and six addresses.
+and bonds, every denial reason, policy and rules invalidation across holders at once, TTL
+expiry, release, revocation, renewal settlement, all three challenge settlements, and an
+accounting audit that recomputes the registry totals by walking the stored records after
+every step of a scenario that interleaves every path across two gates and six addresses.
+
+Two suites exist specifically to hold the lifecycle guarantees that money depends on.
+`test_renewal_settlement.py` establishes that no sequence of lapse-and-renew can strand a
+deposit, and asserts it the only way that cannot be faked: after any number of renewals
+the registry still drains to zero. `test_rules_versioning.py` establishes that each of
+the four adjudication-relevant settings is a versioned eligibility rule on its own, that
+an economic edit is not, that a published frame is immutable, and that a pending
+application is refunded rather than judged under a frame that moved — in both directions,
+including the case where relaxing the frame would have let a gate owner manufacture a
+grant.
 
 **Live.** Real adjudications on StudioNet. Real validators fetch a real public document
 over HTTPS, prompt real models, and consensus really has to agree. The suite proves a
@@ -288,7 +353,10 @@ the binding token path in both directions including an impersonation attempt, a 
 resolving to a denial rather than an error, and the full composability story: an address is
 granted access, is admitted by a separately deployed consumer contract, loses that
 admission the moment the gate owner changes the policy, and regains it when the policy is
-restored and the evidence is re-adjudicated.
+restored and the evidence is re-adjudicated. Two real adjudications also establish the
+renewal path on chain: a grant is invalidated by a rules change, re-earned without being
+released first, and the replaced deposit is refunded in the granting transaction, with
+the registry's locked total returning to exactly where it started.
 
 The live suite is deliberately a subset of the deterministic checks rather than a copy of
 them. Every validation branch is already exercised against the same code inside the real
@@ -302,7 +370,8 @@ adding signal.
 python -m venv .venv && . .venv/bin/activate
 pip install genlayer-test genlayer-py pytest cloudpickle
 
-pytest tests/unit tests/direct      # no network required
+pytest tests/unit                   # no network required
+pytest tests/direct                 # no network required
 
 export GENLAYER_DEPLOYER_KEY=0x...  # a funded StudioNet account that owns the gates
 pytest tests/live
@@ -362,12 +431,28 @@ another.
 Both follow from the same principle: an accusation is not a finding, and neither the
 holder nor the gate owner should be able to change the stakes after one is filed.
 
+**The eligibility frame is versioned and snapshotted, not just read live.** Versioning
+alone would invalidate grants but still leave a pending application reading whatever the
+gate says at adjudication time. Snapshotting alone would protect pending applications but
+leave existing grants standing under requirements that no longer apply. The two defects
+are different, so both mechanisms are present, and the snapshot is keyed by version pair
+rather than copied onto every application: policy text runs to four thousand characters
+and duplicating it per applicant would be a large cost for the same guarantee.
+
+**A renewal refunds the replaced deposit rather than carrying it forward.** Carrying it
+would make a record's deposit larger than one bond, and the challenge settlements split
+a deposit, so the payout arithmetic would quietly drift from the stake that was actually
+posted.
+
 ## Limitations
 
-**A gate owner can rewrite the policy.** That is the point, and it is why every consumer
-should pin the gate owner it expects and expose a way to verify it. The example consumer
-does this in `verify_gate_owner`. A gate meant to serve an ecosystem should be owned by a
-DAO or a multisig, and `transfer_gate_ownership` exists for that.
+**A gate owner can rewrite the policy, and can change how it is checked.** That is the
+point, and it is why every consumer should pin the gate owner it expects and expose a way
+to verify it. The example consumer does this in `verify_gate_owner`. A gate meant to serve
+an ecosystem should be owned by a DAO or a multisig, and `transfer_gate_ownership` exists
+for that. What an owner cannot do is grant access: both kinds of change are versioned, so
+they revoke rather than admit, and a pending application is refunded rather than
+re-judged.
 
 **Evidence must be publicly fetchable over HTTPS.** Validators cannot authenticate, so
 anything behind a login is out of scope. A binding token proves control of the wallet,

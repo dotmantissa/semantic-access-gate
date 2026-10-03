@@ -2,7 +2,7 @@
 
 How to defer your contract's access control to a natural language policy.
 
-StudioNet registry: `0xA21f00DdEDb898e0e10575DCF46B4e2E856E7a5b`
+StudioNet registry: `0xE40dfb2befa0c643665568772C34eaaE852F9F62`
 
 ## The one call
 
@@ -16,7 +16,7 @@ cheap enough to put in front of every gated method.
 ## A consumer contract
 
 The full worked example is `tests/fixtures/gated_consumer.py`, deployed alongside the
-registry at `0xE31855910183e00b69906435EA956CAd0679F61C`. The pattern is:
+registry at `0x65cA947f97175219f8c9692F1893864C019BF54A`. The pattern is:
 
 ```python
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
@@ -76,8 +76,10 @@ after themselves. Decide deliberately which of your methods are about who may ac
 which are about who may undo.
 
 If you need coarse behaviour without a cross-contract call on every write, cache the
-boolean with the policy version you saw and re-check when the version moves. Read
-`get_policy` for the current version.
+boolean with **both** versions you saw and re-check when either moves. Read `get_policy`
+for the current `policy_version` and `rules_version`. Caching on the policy version alone
+would keep serving a stale approval after the gate owner changed the way the policy is
+checked, which invalidates grants just as a rewrite does.
 
 ## Registering a gate
 
@@ -293,12 +295,14 @@ labelled as an unverified claim.
 | `GATE_PAUSED` | Owner has paused intake; live records still work |
 | `APPLICATION_PENDING` | One open application per address per gate |
 | `ALREADY_APPROVED` | Already holds live access |
+| `CHALLENGE_OPEN` | A challenge is open against this address; resolve it first. `open_challenge_id` names it |
 | `COOLDOWN_ACTIVE` | Denied recently; `cooldown_until` says when |
 
 ### Denial codes
 
 | Code | What to tell the applicant |
 |---|---|
+| `EVIDENCE_HOST_NOT_ALLOWED` | A URL is outside the host allowlist this application is judged under. |
 | `EVIDENCE_UNRETRIEVABLE` | The document could not be fetched. Check the URL is public. |
 | `BINDING_TOKEN_MISSING` | The wallet token is not on the document. |
 | `DISQUALIFIER_PRESENT` | Something in the evidence blocks access. `failed_ids` says which. |
@@ -317,29 +321,72 @@ Surface that difference. It usually means the evidence is fine and the model par
 | `NO_RECORD` | Never granted |
 | `EXPIRED` | Lifetime elapsed |
 | `POLICY_SUPERSEDED` | Granted under an older policy version; reapply |
+| `RULES_SUPERSEDED` | Granted under an older adjudication frame; reapply |
 | `REVOKED` | Closed by the gate owner or an upheld challenge |
 | `RELEASED` | Given up voluntarily |
+| `RENEWED` | Replaced by a later grant to the same address; its deposit was refunded |
 
-`POLICY_SUPERSEDED` is the one worth handling explicitly. The applicant did nothing
-wrong; the rules changed.
+`POLICY_SUPERSEDED` and `RULES_SUPERSEDED` are the two worth handling explicitly. The
+applicant did nothing wrong; the rules changed. The first means the gate owner rewrote
+what the policy requires, the second that they changed how it is checked. Both are
+recoverable by reapplying, and in both cases the holder's deposit is still fully
+reclaimable through `release_access`.
 
-## Policy updates
+## Rule changes
 
-`update_policy` increments the gate's version and every outstanding record stops
-counting immediately. One write, no iteration, no migration, whether the gate has three
+A gate carries two version counters, and either one moving invalidates every outstanding
+record immediately. One write, no iteration, no migration, whether the gate has three
 holders or ten thousand.
 
-This means a consumer contract inherits policy changes with no deployment. It also means
-a gate owner can lock every holder out in one transaction, which is why the owner is part
+| Counter | Bumped by | Covers |
+|---|---|---|
+| `policy_version` | `update_policy` | `policy_text`, `conditions_json`, `disqualifiers_json` |
+| `rules_version` | `update_gate_config` | `allowed_hosts_json`, `fetch_mode`, `binding_required`, `require_grounded_quotes` |
+
+`update_gate_config` also sets the bond, the stake, the lifetime and the cooldown, and
+editing only those moves nothing — a gate can be repriced without revoking its holders.
+It bumps `rules_version` only when one of the four adjudication-relevant settings
+actually changes, compared against the canonicalized stored form, so reordering a host
+list is a no-op rather than a mass revocation. The return value is the resulting
+`rules_version`.
+
+All four of those settings decide who qualifies, which is why they are versioned rather
+than treated as configuration. `binding_required` and `require_grounded_quotes` in
+particular are the two deterministic checks standing between a document and a grant, and
+`allowed_hosts` decides what counts as evidence at all.
+
+This means a consumer contract inherits rule changes with no deployment. It also means a
+gate owner can lock every holder out in one transaction, which is why the owner is part
 of your trust model and why a gate serving an ecosystem should be owned by a DAO or a
-multisig.
+multisig. What the owner cannot do is grant access: each version pair publishes an
+immutable rules snapshot that adjudication reads instead of the live gate, and the owner
+has no write path to a published snapshot.
 
-Use `update_gate_config` for bonds, lifetimes, hosts, fetch mode and cooldowns. It does
-not bump the version, because none of those change what the policy requires. Use
-`update_policy` when the requirements change, and expect every holder to reapply.
+An application filed before a change and adjudicated after it is closed as `SUPERSEDED`
+and refunded in full, never judged against rules its applicant did not see. Read any
+past frame back with `get_rules(gate_id, policy_version, rules_version)` — snapshots are
+immutable and are never collected, so a past decision stays auditable against the rules
+that actually produced it.
 
-An application filed before an update and adjudicated after it is closed as `SUPERSEDED`
-and refunded in full, never judged against conditions its applicant did not see.
+An open challenge caught by a change closes as `VOID` with the stake returned in full,
+since neither side staked against the new frame.
+
+## Renewals
+
+A holder whose record has lapsed, by expiry or by a version bump, may apply again without
+releasing first. Because an access record lives at one slot per gate and holder, the new
+grant replaces the lapsed record — so the grant closes that record as `RENEWED`, archives
+it, and refunds its deposit in the same transaction. A renewed record holds exactly one
+bond, and `locked_wei` never grows across a renewal.
+
+If you display a holder's history, read `get_access_history(gate_id, holder, offset,
+limit)`. It returns the records that have been replaced, oldest first, each with the
+deposit it carried and the reason it closed. The record currently in the slot is not
+included; use `get_access_record` for that one.
+
+One intake rule follows from this: an address with an open challenge against it cannot
+apply, even once its record has lapsed, because a renewal would otherwise replace the
+record the challenge is riding on. `can_apply` reports this as `CHALLENGE_OPEN`.
 
 ## Off-chain reads
 
@@ -410,7 +457,10 @@ can change the stakes after you have staked.
 - [ ] Choose a TTL that bounds staleness for your risk, not for convenience
 - [ ] Set the challenge stake at or above the bond
 - [ ] Check receipts by reading the leader receipts, not the status name
-- [ ] Handle `POLICY_SUPERSEDED` distinctly from a denial in your UI
+- [ ] Handle `POLICY_SUPERSEDED` and `RULES_SUPERSEDED` distinctly from a denial in your UI
+- [ ] Cache approval against both versions, not just `policy_version`
+- [ ] Treat an `update_gate_config` that touches hosts, fetch mode, binding or grounding
+      as a revocation event, because that is what it is
 - [ ] Transfer gate ownership to a multisig or DAO before others build on it
 
 ## Method reference
@@ -448,8 +498,10 @@ can_apply(gate_id, subject) -> str
 evidence_host_allowed(gate_id, url) -> bool
 get_gate(gate_id) -> str
 get_policy(gate_id) -> str
+get_rules(gate_id, policy_version, rules_version) -> str
 get_application(application_id) -> str
 get_access_record(gate_id, holder) -> str
+get_access_history(gate_id, holder, offset, limit) -> str
 get_challenge(challenge_id) -> str
 list_gates(offset, limit) -> str
 list_applications(gate_id, offset, limit) -> str
