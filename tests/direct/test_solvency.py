@@ -18,8 +18,10 @@ import pytest
 from conftest import (
     BOND,
     CHALLENGE_STAKE,
+    COOLDOWN,
     EVIDENCE_URL,
     GATE_ID,
+    TTL,
     apply_as,
     grant_everything,
     licence_page,
@@ -41,6 +43,11 @@ def audit(contract):
     Nothing here reads the contract's counters to derive the expected value; it walks
     gates, applications, access records and challenges and adds up what each one says
     it is holding. Returns the reconstructed figures so callers can assert on them.
+
+    Archived records are walked too. They should always report a zero deposit, because
+    a record is only archived after its deposit has been settled, so including them
+    means a renewal that closed a record without paying it out would show up here as a
+    total the live records cannot account for rather than passing unnoticed.
     """
     stats = json.loads(contract.get_registry_stats())
     gate_ids = json.loads(contract.list_gates(0, 100))["gate_ids"]
@@ -62,6 +69,16 @@ def audit(contract):
         for entry in holders:
             record = json.loads(contract.get_access_record(gate_id, entry["holder"]))
             expected_locked += int(record["deposit_wei"])
+
+            history = json.loads(
+                contract.get_access_history(gate_id, entry["holder"], 0, 100)
+            )
+            for archived in history["records"]:
+                assert archived["deposit_wei"] == "0", (
+                    f"archived record {archived['application_id']} still holds "
+                    f"{archived['deposit_wei']} wei with no way to reclaim it"
+                )
+                expected_locked += int(archived["deposit_wei"])
 
     for index in range(int(stats["challenge_count"])):
         challenge = json.loads(contract.get_challenge("chal_" + str(index)))
@@ -384,6 +401,36 @@ def test_invariant_holds_through_a_long_mixed_scenario(
     locked, _treasury = audit(registry)
     assert locked == BOND, "carol keeps her deposit and her access"
     assert registry.is_approved("gate-two", carol) is True
+
+    # A holder lets access lapse and is granted again without releasing first. The
+    # deposit behind the replaced record has to be refunded in that same transaction.
+    warp_time(direct_vm, "2026-02-20T12:00:00Z")
+    grant_to(registry, direct_vm, dave, gate_id="gate-one")
+    assert registry.is_approved("gate-one", dave) is True
+    assert json.loads(registry.get_access_history("gate-one", dave, 0, 10))["total"] == 0
+    audit(registry)
+
+    warp_time(direct_vm, "2026-03-05T12:00:00Z")  # well past the one day gate-one ttl
+    assert registry.is_approved("gate-one", dave) is False, "the grant lapsed on its own"
+    grant_to(registry, direct_vm, dave, gate_id="gate-one")
+    archived = json.loads(registry.get_access_history("gate-one", dave, 0, 10))
+    assert archived["total"] == 1, "the replaced record was archived, not overwritten"
+    assert archived["records"][0]["status"] == "RENEWED"
+    assert archived["records"][0]["deposit_wei"] == "0", "its deposit was refunded"
+    audit(registry)
+
+    # An eligibility rule change invalidates the renewed grant, and the holder takes
+    # their collateral back rather than losing it to a rule they never agreed to.
+    direct_vm.sender = direct_owner
+    registry.update_gate_config(
+        "gate-one", json.dumps(["registry.example.com", "boards.example.org"]),
+        "raw", False, True, TTL, BOND, CHALLENGE_STAKE, COOLDOWN,
+    )
+    assert registry.is_approved("gate-one", dave) is False
+    audit(registry)
+    direct_vm.sender = dave
+    assert int(registry.release_access("gate-one")) == BOND
+    audit(registry)
 
     # Owners drain what they earned, and the locked funds are untouched.
     for gate_id in ("gate-one", "gate-two"):

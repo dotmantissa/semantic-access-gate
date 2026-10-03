@@ -23,7 +23,9 @@ from conftest import (
     CONSUMER_GATE_DISQUALIFIERS,
     CONSUMER_GATE_POLICY,
     EVIDENCE_HOST_ECHO,
+    EVIDENCE_HOST_REAL,
     LIVE_BOND,
+    LIVE_STAKE,
     LIVE_TTL,
     README_URL,
     apply_and_get_id,
@@ -36,6 +38,7 @@ from conftest import (
     read_json,
     release_if_held,
     send,
+    unique_gate_id,
 )
 
 pytestmark = pytest.mark.live
@@ -53,6 +56,15 @@ def adjudicate_fresh(client, registry, gate_id, urls, note, bond):
     app_id = apply_and_get_id(client, registry, gate_id, urls, note, bond)
     send(client, registry, "adjudicate", [app_id])
     return read_json(client, registry, "get_application", [app_id])
+
+
+def restore_frame(client, registry, gate_id, hosts, binding_required, grounded, bond, stake):
+    """Put a gate's adjudication frame back, so the deployment is left reusable."""
+    send(
+        client, registry, "update_gate_config",
+        [gate_id, json.dumps(hosts), "raw", binding_required, grounded,
+         LIVE_TTL, bond, stake, 0],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -464,3 +476,97 @@ def test_the_registry_accounting_is_consistent_after_the_live_run(owner, registr
     )
     assert int(stats["treasury_wei"]) == summed
     assert int(stats["locked_wei"]) >= 0
+
+
+def test_a_renewal_refunds_the_deposit_behind_the_record_it_replaces(
+    owner, registry_address
+):
+    """
+    Live proof that a renewal cannot strand a holder's collateral.
+
+    An access record lives at one slot per holder, so re-granting has to replace
+    whatever is in it. The record being replaced here was invalidated by a rules change
+    rather than deleted, so it is still ACTIVE and still holding the deposit that backed
+    it. Overwriting it would leave that deposit inside the registry's locked total with
+    no record pointing at it and no method able to reach it.
+
+    Two real adjudications run here. The assertion that matters is the last one: after
+    the renewal the holder releases their one live record and the registry's locked total
+    returns to exactly what it was before any of this started, which is only true if
+    nothing was stranded on the way.
+    """
+    gate_id = unique_gate_id("live-renewal")
+    ensure_gate(
+        owner, registry_address, gate_id,
+        title="Renewal Settlement Gate",
+        policy_text=CONSUMER_GATE_POLICY,
+        conditions=CONSUMER_GATE_CONDITIONS,
+        disqualifiers=CONSUMER_GATE_DISQUALIFIERS,
+        allowed_hosts=[EVIDENCE_HOST_REAL],
+        binding_required=False,
+        require_grounded_quotes=True,
+        bond_wei=LIVE_BOND,
+    )
+    address = owner.local_account.address
+    baseline = int(read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"])
+
+    first = adjudicate_fresh(
+        owner, registry_address, gate_id, [README_URL], "Original grant.", LIVE_BOND
+    )
+    assert first["status"] == "GRANTED", first["reasoning"]
+    assert read(owner, registry_address, "is_approved", [gate_id, address]) is True
+    assert int(
+        read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"]
+    ) == baseline + LIVE_BOND
+
+    # Invalidate the grant without touching the record, by moving the rules version.
+    # Nothing is written to the record: it stays ACTIVE and keeps its deposit.
+    send(
+        owner, registry_address, "update_gate_config",
+        [gate_id, json.dumps([EVIDENCE_HOST_REAL]), "raw", False,
+         False,  # quote grounding switched off: an eligibility change
+         LIVE_TTL, LIVE_BOND, LIVE_STAKE, 0],
+    )
+    assert read(owner, registry_address, "is_approved", [gate_id, address]) is False
+    stale = read_json(owner, registry_address, "get_access_record", [gate_id, address])
+    assert stale["status"] == "ACTIVE", "invalidation rewrites nothing"
+    assert stale["deposit_wei"] == str(LIVE_BOND), "the lapsed record still holds its deposit"
+    assert read_json(owner, registry_address, "access_status",
+                     [gate_id, address])["reason"] == "RULES_SUPERSEDED"
+
+    # Re-qualify under the new frame WITHOUT releasing first. This is the renewal.
+    app_id = apply_and_get_id(
+        owner, registry_address, gate_id, [README_URL], "Renewal under the new frame.", LIVE_BOND
+    )
+    send(owner, registry_address, "adjudicate", [app_id])
+    renewed = read_json(owner, registry_address, "get_application", [app_id])
+    assert renewed["status"] == "GRANTED", renewed["reasoning"]
+    assert read(owner, registry_address, "is_approved", [gate_id, address]) is True
+
+    # The replaced record was archived with its deposit settled, not overwritten.
+    history = read_json(owner, registry_address, "get_access_history", [gate_id, address, 0, 10])
+    assert int(history["total"]) >= 1
+    archived = history["records"][-1]
+    assert archived["application_id"] == first["application_id"]
+    assert archived["status"] == "RENEWED"
+    assert archived["deposit_wei"] == "0", "the replaced deposit was paid out"
+    assert app_id in archived["close_reason"]
+
+    # Exactly one bond is behind the live record, and the registry's obligation never
+    # grew to two.
+    live = read_json(owner, registry_address, "get_access_record", [gate_id, address])
+    assert live["application_id"] == app_id
+    assert live["deposit_wei"] == str(LIVE_BOND)
+    assert int(
+        read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"]
+    ) == baseline + LIVE_BOND
+
+    # The decisive check: the holder can still get every wei back.
+    send(owner, registry_address, "release_access", [gate_id])
+    assert int(
+        read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"]
+    ) == baseline, "the renewal stranded funds that can never be reclaimed"
+
+    restore_frame(
+        owner, registry_address, gate_id, [EVIDENCE_HOST_REAL], False, True, LIVE_BOND, LIVE_STAKE
+    )

@@ -150,6 +150,112 @@ def test_and_reduction_property_exhaustively(contract_module):
 
 
 # ---------------------------------------------------------------------------
+# Evidence admissibility: the host allowlist as an adjudication rule
+# ---------------------------------------------------------------------------
+# The allowlist is part of the frozen frame an application is judged under, not just
+# an intake filter, so the reducer has to treat an inadmissible document set as a
+# denial in its own right. Because every public path stamps the frame and supersedes
+# an application whose frame moved, this branch is unreachable from outside the
+# contract - which is exactly why it is pinned here rather than left untested.
+
+
+def test_inadmissible_evidence_denies_with_its_own_code(contract_module):
+    m = contract_module
+    decision, code, failed = m._reduce_decision([sat("c1")], [], True, True, False)
+    assert decision == m.DECISION_DENIED
+    assert code == m.DENIAL_HOST_NOT_ALLOWED
+    assert failed == []
+
+
+def test_admissibility_outranks_every_other_finding(contract_module):
+    """
+    A document from a host the frame does not permit is not evidence, so nothing read
+    out of it - not a satisfied condition, not a binding match - can outweigh that.
+    """
+    m = contract_module
+    for binding_ok in (True, False):
+        for evidence_ok in (True, False):
+            decision, code, _ = m._reduce_decision(
+                [sat("c1")], [disq("d1", True)], binding_ok, evidence_ok, False
+            )
+            assert (decision, code) == (m.DECISION_DENIED, m.DENIAL_HOST_NOT_ALLOWED)
+
+
+def test_admissible_evidence_leaves_the_reduction_unchanged(contract_module):
+    """Passing admissibility must be a no-op, not a new way to grant."""
+    m = contract_module
+    assert m._reduce_decision([sat("c1")], [], True, True, True) == m._reduce_decision(
+        [sat("c1")], [], True, True
+    )
+    assert m._reduce_decision([unsat("c1")], [], True, True, True) == m._reduce_decision(
+        [unsat("c1")], [], True, True
+    )
+
+
+def test_admissibility_defaults_to_permitted_for_older_payloads(contract_module):
+    """
+    The parameter defaults to True so a leader payload that omits hosts_ok re-reduces
+    the same way a validator's own run would, rather than flipping to a denial on a
+    missing key.
+    """
+    m = contract_module
+    decision, _code, _failed = m._reduce_decision([sat("c1")], [], True, True)
+    assert decision == m.DECISION_GRANTED
+
+
+def test_an_inadmissible_document_is_never_fetched(contract_module, stub):
+    """
+    The point of checking admissibility before retrieval: a disallowed host must not
+    be contacted at all, so narrowing an allowlist cannot turn into a fetch the frame
+    never authorized.
+    """
+    m = contract_module
+    contacted = []
+
+    def handler(url):
+        contacted.append(url)
+        return stub.WebResponse(200, b"credential evidence")
+
+    stub._Web.get_handler = handler
+    docs = m._fetch_evidence(
+        ["https://registry.example.com/ok", "https://elsewhere.example.net/bad"],
+        "raw",
+        ["registry.example.com"],
+    )
+
+    assert contacted == ["https://registry.example.com/ok"]
+    assert [d["admissible"] for d in docs] == [True, False]
+    assert docs[1]["retrievable"] is False
+    assert docs[1]["text"] == ""
+
+
+def test_an_empty_allowlist_admits_every_document(contract_module, stub):
+    m = contract_module
+    stub._Web.get_handler = lambda url: stub.WebResponse(200, b"evidence")
+    docs = m._fetch_evidence(["https://anything.example.org/x"], "raw", [])
+    assert docs[0]["admissible"] is True
+    assert docs[0]["retrievable"] is True
+
+
+def test_a_subdomain_of_an_allowed_host_is_admissible(contract_module, stub):
+    m = contract_module
+    stub._Web.get_handler = lambda url: stub.WebResponse(200, b"evidence")
+    docs = m._fetch_evidence(
+        ["https://sub.registry.example.com/x"], "raw", ["registry.example.com"]
+    )
+    assert docs[0]["admissible"] is True
+
+
+def test_a_lookalike_host_is_inadmissible(contract_module, stub):
+    m = contract_module
+    stub._Web.get_handler = lambda url: stub.WebResponse(200, b"evidence")
+    docs = m._fetch_evidence(
+        ["https://evilregistry.example.com/x"], "raw", ["registry.example.com"]
+    )
+    assert docs[0]["admissible"] is False
+
+
+# ---------------------------------------------------------------------------
 # Host parsing and allowlisting
 # ---------------------------------------------------------------------------
 

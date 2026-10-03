@@ -47,6 +47,7 @@ def make_spec(**overrides):
         "who are board certified and free of disciplinary history.",
         "conditions": [dict(c) for c in CONDITIONS],
         "disqualifiers": [dict(d) for d in DISQUALIFIERS],
+        "allowed_hosts": [],
         "fetch_mode": "raw",
         "binding_required": True,
         "require_grounded_quotes": True,
@@ -112,8 +113,9 @@ def consistent_leader_output(module, decision, conditions, disqualifiers, **extr
     """
     binding_ok = extra.get("binding_ok", True)
     evidence_ok = extra.get("evidence_ok", True)
+    hosts_ok = extra.get("hosts_ok", True)
     reduced, code, failed = module._reduce_decision(
-        conditions, disqualifiers, binding_ok, evidence_ok
+        conditions, disqualifiers, binding_ok, evidence_ok, hosts_ok
     )
     assert reduced == decision, "test helper built an inconsistent payload"
     return {
@@ -122,10 +124,16 @@ def consistent_leader_output(module, decision, conditions, disqualifiers, **extr
         "failed_ids": failed,
         "binding_ok": binding_ok,
         "evidence_ok": evidence_ok,
+        "hosts_ok": hosts_ok,
         "conditions": conditions,
         "disqualifiers": disqualifiers,
         "evidence_status": [
-            {"url": "https://registry.example.com/jane-okafor", "status": 200, "retrievable": True}
+            {
+                "url": "https://registry.example.com/jane-okafor",
+                "status": 200,
+                "retrievable": True,
+                "admissible": True,
+            }
         ],
         "reasoning": "leader",
     }
@@ -138,7 +146,7 @@ def consistent_leader_output(module, decision, conditions, disqualifiers, **extr
 
 def test_successful_fetch_is_retrievable(contract_module, stub):
     serve(stub, {"https://a.example.com/x": (200, "hello world")})
-    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw")
+    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert docs[0]["retrievable"] is True
     assert docs[0]["text"] == "hello world"
     assert docs[0]["status"] == 200
@@ -151,7 +159,7 @@ def test_deterministic_absence_denies_rather_than_erroring(contract_module, stub
     denial. Turning it into an error would revert the transaction and strand the bond.
     """
     serve(stub, {"https://a.example.com/x": (status, "nope")})
-    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw")
+    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert docs[0]["retrievable"] is False
     assert docs[0]["text"] == ""
 
@@ -165,13 +173,13 @@ def test_transient_faults_raise_a_classified_error(contract_module, stub, status
     m = contract_module
     serve(stub, {"https://a.example.com/x": (status, "")})
     with pytest.raises(m.gl.vm.UserError) as exc:
-        m._fetch_evidence(["https://a.example.com/x"], "raw")
+        m._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert exc.value.message.startswith(m.ERROR_TRANSIENT)
 
 
 def test_empty_body_with_200_is_not_retrievable(contract_module, stub):
     serve(stub, {"https://a.example.com/x": (200, "   ")})
-    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw")
+    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert docs[0]["retrievable"] is False
 
 
@@ -183,20 +191,20 @@ def test_network_exception_raises_transient(contract_module, stub):
 
     stub._Web.get_handler = boom
     with pytest.raises(m.gl.vm.UserError) as exc:
-        m._fetch_evidence(["https://a.example.com/x"], "raw")
+        m._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert exc.value.message.startswith(m.ERROR_TRANSIENT)
 
 
 def test_evidence_text_is_truncated_to_the_limit(contract_module, stub):
     m = contract_module
     serve(stub, {"https://a.example.com/x": (200, "y" * 10000)})
-    docs = m._fetch_evidence(["https://a.example.com/x"], "raw")
+    docs = m._fetch_evidence(["https://a.example.com/x"], "raw", [])
     assert len(docs[0]["text"]) == m.EVIDENCE_TEXT_LIMIT
 
 
 def test_render_mode_extracts_text(contract_module, stub):
     stub._Web.render_handler = lambda url, mode: "rendered content here"
-    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "render")
+    docs = contract_module._fetch_evidence(["https://a.example.com/x"], "render", [])
     assert docs[0]["retrievable"] is True
     assert docs[0]["text"] == "rendered content here"
 
@@ -209,7 +217,7 @@ def test_render_failure_raises_transient(contract_module, stub):
 
     stub._Web.render_handler = boom
     with pytest.raises(m.gl.vm.UserError) as exc:
-        m._fetch_evidence(["https://a.example.com/x"], "render")
+        m._fetch_evidence(["https://a.example.com/x"], "render", [])
     assert exc.value.message.startswith(m.ERROR_TRANSIENT)
 
 
@@ -222,7 +230,7 @@ def test_multiple_documents_are_fetched_in_order(contract_module, stub):
         },
     )
     docs = contract_module._fetch_evidence(
-        ["https://a.example.com/1", "https://a.example.com/2"], "raw"
+        ["https://a.example.com/1", "https://a.example.com/2"], "raw", []
     )
     assert [d["text"] for d in docs] == ["first", "second"]
 
@@ -480,6 +488,137 @@ def test_adjudication_is_reproducible_across_repeated_runs(contract_module, stub
     first = m._run_adjudication(spec)
     for _ in range(10):
         assert m._run_adjudication(spec)["decision"] == first["decision"]
+
+
+# ---------------------------------------------------------------------------
+# Admissibility inside a full adjudication round
+# ---------------------------------------------------------------------------
+
+
+def test_an_inadmissible_host_denies_without_consulting_the_model(contract_module, stub):
+    """
+    The frame's allowlist is applied before anything is fetched or prompted, so this
+    resolves to a denial with no network call and no model call at all. No LLM handler
+    is installed, so reaching the model would raise instead of passing.
+    """
+    m = contract_module
+    spec = make_spec(
+        evidence_urls=["https://elsewhere.example.net/jane"],
+        allowed_hosts=["registry.example.com"],
+    )
+    out = m._run_adjudication(spec)
+
+    assert out["decision"] == m.DECISION_DENIED
+    assert out["denial_code"] == m.DENIAL_HOST_NOT_ALLOWED
+    assert out["hosts_ok"] is False
+    assert out["conditions"] == []
+    assert out["evidence_status"][0]["admissible"] is False
+    assert "allowlist" in out["reasoning"]
+
+
+def test_one_inadmissible_url_fails_the_whole_evidence_set(contract_module, stub):
+    """
+    A partially admissible bundle is not quietly adjudicated on the admissible half.
+    An applicant is told their submission was rejected rather than silently judged on
+    less than they filed.
+    """
+    m = contract_module
+    serve(stub, {"https://registry.example.com/jane-okafor": (200, LICENCE_PAGE)})
+    respond(stub, model_grants())
+    spec = make_spec(
+        evidence_urls=[
+            "https://registry.example.com/jane-okafor",
+            "https://elsewhere.example.net/extra",
+        ],
+        allowed_hosts=["registry.example.com"],
+    )
+    out = m._run_adjudication(spec)
+
+    assert out["decision"] == m.DECISION_DENIED
+    assert out["denial_code"] == m.DENIAL_HOST_NOT_ALLOWED
+
+
+def test_an_admissible_bundle_grants_normally(contract_module, stub):
+    """The allowlist must gate nothing it permits."""
+    m = contract_module
+    serve(stub, {"https://registry.example.com/jane-okafor": (200, LICENCE_PAGE)})
+    respond(stub, model_grants())
+    out = m._run_adjudication(
+        make_spec(allowed_hosts=["registry.example.com", "boards.example.org"])
+    )
+    assert out["decision"] == m.DECISION_GRANTED
+    assert out["hosts_ok"] is True
+
+
+def test_the_prompt_labels_an_inadmissible_document_as_such(contract_module):
+    """
+    An inadmissible document must not be presented to the model as a dead link, since
+    those are different facts and only one of them is about the applicant's evidence.
+    """
+    m = contract_module
+    prompt = m._build_prompt(
+        make_spec(),
+        [
+            {
+                "url": "https://elsewhere.example.net/x",
+                "status": 0,
+                "retrievable": False,
+                "admissible": False,
+                "text": "",
+            }
+        ],
+    )
+    assert "NOT ADMISSIBLE" in prompt
+    assert "COULD NOT BE RETRIEVED" not in prompt
+
+
+def test_rule_two_rejects_a_leader_hiding_an_inadmissible_bundle(contract_module):
+    """
+    Rule 2 re-reduces the leader's own reported findings, admissibility included. A
+    leader cannot report hosts_ok=False and still have a GRANTED decision accepted.
+    """
+    m = contract_module
+    payload = consistent_leader_output(
+        m, m.DECISION_GRANTED, model_grants()["conditions"], model_grants()["disqualifiers"]
+    )
+    payload["hosts_ok"] = False
+    assert m._leader_audit_is_consistent(payload) is False
+
+
+def test_rule_two_accepts_a_consistent_inadmissibility_denial(contract_module):
+    m = contract_module
+    payload = consistent_leader_output(
+        m, m.DECISION_DENIED, [], [], hosts_ok=False
+    )
+    assert payload["denial_code"] == m.DENIAL_HOST_NOT_ALLOWED
+    assert m._leader_audit_is_consistent(payload) is True
+
+
+def test_rule_two_rejects_a_mislabelled_inadmissibility_denial(contract_module):
+    """
+    The denial code is part of the audit trail, so a leader cannot deny for an
+    inadmissible host while telling the chain the evidence was merely unreachable.
+    """
+    m = contract_module
+    payload = consistent_leader_output(m, m.DECISION_DENIED, [], [], hosts_ok=False)
+    payload["denial_code"] = m.DENIAL_UNRETRIEVABLE
+    assert m._leader_audit_is_consistent(payload) is False
+
+
+def test_a_validator_reproduces_an_inadmissibility_denial(contract_module, stub):
+    """
+    Rule 3 end to end on this branch: the frame is in the spec both nodes share, so a
+    validator derives the same denial from it without seeing the leader's answer.
+    """
+    m = contract_module
+    spec = make_spec(
+        evidence_urls=["https://elsewhere.example.net/jane"],
+        allowed_hosts=["registry.example.com"],
+    )
+    leader_output = m._run_adjudication(spec)
+    own = m._run_adjudication(spec)
+    assert leader_output["decision"] == own["decision"]
+    assert m._leader_audit_is_consistent(leader_output) is True
 
 
 # ---------------------------------------------------------------------------

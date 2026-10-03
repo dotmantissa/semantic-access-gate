@@ -35,6 +35,7 @@ from conftest import (
     read,
     read_json,
     send,
+    unique_gate_id,
 )
 
 pytestmark = pytest.mark.live
@@ -70,9 +71,9 @@ def test_deployed_schema_exposes_the_full_interface(owner, registry_address):
     views = (
         "is_approved", "access_status", "binding_token", "can_apply",
         "evidence_host_allowed", "get_gate", "get_policy", "get_application",
-        "get_access_record", "get_challenge", "list_gates", "list_applications",
-        "list_holders", "get_applicant_applications", "gate_stats",
-        "get_registry_stats",
+        "get_access_record", "get_access_history", "get_challenge", "get_rules",
+        "list_gates", "list_applications", "list_holders",
+        "get_applicant_applications", "gate_stats", "get_registry_stats",
     )
 
     for name in writes:
@@ -117,16 +118,39 @@ def test_the_gate_stores_its_policy_verbatim(owner, owner_account, registry_addr
     assert gate["fetch_mode"] == "raw"
     assert gate["require_grounded_quotes"] is True
     assert int(gate["policy_version"]) >= 1
+    assert int(gate["rules_version"]) >= 1
     assert int(gate["access_ttl_seconds"]) == LIVE_TTL
     assert gate["bond_wei"] == str(LIVE_BOND)
     assert gate["challenge_stake_wei"] == str(LIVE_STAKE)
 
     # get_policy must agree with get_gate: they are what validators adjudicate against.
+    # The whole eligibility frame is compared, not only the prose, because the
+    # mechanical requirements decide who qualifies just as directly as the text does.
     policy = read_json(owner, registry_address, "get_policy", [consumer_gate])
     assert policy["policy_text"] == gate["policy_text"]
     assert policy["policy_version"] == gate["policy_version"]
+    assert policy["rules_version"] == gate["rules_version"]
     assert policy["conditions"] == gate["conditions"]
     assert policy["disqualifiers"] == gate["disqualifiers"]
+    assert policy["allowed_hosts"] == gate["allowed_hosts"]
+    assert policy["fetch_mode"] == gate["fetch_mode"]
+    assert policy["binding_required"] == gate["binding_required"]
+    assert policy["require_grounded_quotes"] == gate["require_grounded_quotes"]
+
+    # The frame the gate is currently on must be published and byte-identical to it,
+    # because that published snapshot is what adjudications actually read.
+    frame = read_json(
+        owner, registry_address, "get_rules",
+        [consumer_gate, int(gate["policy_version"]), int(gate["rules_version"])],
+    )
+    assert frame["gate_id"] == consumer_gate
+    assert frame["policy_text"] == gate["policy_text"]
+    assert frame["conditions"] == gate["conditions"]
+    assert frame["disqualifiers"] == gate["disqualifiers"]
+    assert frame["allowed_hosts"] == gate["allowed_hosts"]
+    assert frame["fetch_mode"] == gate["fetch_mode"]
+    assert frame["binding_required"] == gate["binding_required"]
+    assert frame["require_grounded_quotes"] == gate["require_grounded_quotes"]
 
 
 def test_the_wallet_bound_gate_requires_proof_of_control(owner, registry_address, bound_gate):
@@ -176,7 +200,10 @@ def test_preflight_and_binding_token_views(owner, other, registry_address, bound
     assert pre["required_bond_wei"] == str(LIVE_BOND)
     assert pre["binding_required"] is True
     assert pre["binding_token"] == mine
-    assert pre["reason"] in ("OK", "ALREADY_APPROVED", "APPLICATION_PENDING", "COOLDOWN_ACTIVE")
+    assert pre["reason"] in (
+        "OK", "ALREADY_APPROVED", "APPLICATION_PENDING", "COOLDOWN_ACTIVE",
+        "CHALLENGE_OPEN",
+    )
 
 
 def test_the_host_allowlist_view_matches_the_gate(owner, registry_address, consumer_gate):
@@ -230,14 +257,40 @@ def test_a_duplicate_gate_id_is_refused_on_chain(owner, registry_address, consum
     assert "already registered" in failure, failure
 
 
-def test_evidence_on_a_disallowed_host_is_refused_on_chain(owner, registry_address, consumer_gate):
+def test_evidence_on_a_disallowed_host_is_refused_on_chain(owner, registry_address):
     """
     The allowlist is enforced before a bond is taken, so an applicant cannot pay to have
     evidence they host themselves adjudicated against a gate that does not accept it.
+
+    This runs against its own gate rather than the consumer gate. Intake checks a live
+    access record before it validates the evidence URLs, so asserting the host refusal
+    on a gate this address might already hold access to would assert the wrong guard
+    depending on which other tests had run first.
     """
+    gate_id = unique_gate_id("live-host-refusal")
+    ensure_gate(
+        owner, registry_address, gate_id,
+        title="Host Allowlist Gate",
+        policy_text=CONSUMER_GATE_POLICY,
+        conditions=CONSUMER_GATE_CONDITIONS,
+        allowed_hosts=[EVIDENCE_HOST_REAL],
+        binding_required=False,
+        bond_wei=LIVE_BOND,
+    )
+    assert read_json(owner, registry_address, "can_apply",
+                     [gate_id, owner.local_account.address])["eligible"] is True
+
     failure = expect_revert(
         owner, registry_address, "apply_for_access",
-        [consumer_gate, json.dumps(["https://pastebin.example.net/forged"]), "note"],
+        [gate_id, json.dumps(["https://pastebin.example.net/forged"]), "note"],
+        value=LIVE_BOND,
+    )
+    assert "Host not permitted" in failure, failure
+
+    # And the mixed case: one permitted URL does not carry a disallowed one in with it.
+    failure = expect_revert(
+        owner, registry_address, "apply_for_access",
+        [gate_id, json.dumps([README_URL, "https://pastebin.example.net/forged"]), "note"],
         value=LIVE_BOND,
     )
     assert "Host not permitted" in failure, failure
@@ -365,6 +418,150 @@ def test_a_policy_change_supersedes_a_pending_application_and_refunds_it(owner, 
     )
     assert read_json(owner, registry_address, "can_apply",
                      [gate_id, owner.local_account.address])["eligible"] is True
+
+
+def test_a_rules_change_supersedes_a_pending_application_and_refunds_it(
+    owner, registry_address
+):
+    """
+    The same fairness guarantee as a policy change, for the mechanical half of the
+    eligibility frame. The owner switches the wallet binding requirement on after the
+    bond is posted; the application is refunded rather than judged against a check the
+    applicant never agreed to.
+
+    This direction matters most in the other sense. Had the owner been switching
+    binding and quote grounding OFF, judging the application under the new frame would
+    have removed the only two deterministic barriers between a document and a grant,
+    letting the gate owner manufacture access the evidence never earned.
+    """
+    gate_id = unique_gate_id("live-rules-supersede")
+    ensure_gate(
+        owner, registry_address, gate_id,
+        title="Rules Supersede Refund Gate",
+        policy_text=CONSUMER_GATE_POLICY,
+        conditions=CONSUMER_GATE_CONDITIONS,
+        allowed_hosts=[EVIDENCE_HOST_REAL],
+        binding_required=False,
+        bond_wei=LIVE_BOND,
+    )
+
+    app_id = apply_and_get_id(
+        owner, registry_address, gate_id, [README_URL],
+        "Filed under the earlier adjudication rules.", LIVE_BOND,
+    )
+    filed = read_json(owner, registry_address, "get_application", [app_id])
+    filed_rules = int(filed["rules_version"])
+    locked_after_apply = int(
+        read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"]
+    )
+
+    send(
+        owner, registry_address, "update_gate_config",
+        [
+            gate_id, json.dumps([EVIDENCE_HOST_REAL]), "raw",
+            True,   # binding_required switched on: an eligibility change
+            True, LIVE_TTL, LIVE_BOND, LIVE_STAKE, 0,
+        ],
+    )
+    gate = read_json(owner, registry_address, "get_gate", [gate_id])
+    assert int(gate["rules_version"]) == filed_rules + 1
+    assert int(gate["policy_version"]) == int(filed["policy_version"]), "policy untouched"
+
+    send(owner, registry_address, "adjudicate", [app_id])
+
+    settled = read_json(owner, registry_address, "get_application", [app_id])
+    assert settled["status"] == "SUPERSEDED"
+    assert settled["decision"] == ""
+    assert settled["conditions"] == [], "no evidence was fetched and no model was called"
+    assert f"rules changed from version {filed_rules}" in settled["reasoning"]
+
+    assert gate["treasury_wei"] == "0", "a supersede is a refund, never revenue"
+    assert int(gate["total_denied"]) == 0
+    assert int(
+        read_json(owner, registry_address, "get_registry_stats", [])["locked_wei"]
+    ) == locked_after_apply - LIVE_BOND
+    assert read_json(owner, registry_address, "can_apply",
+                     [gate_id, owner.local_account.address])["eligible"] is True
+
+
+def test_an_economic_change_moves_no_version(owner, registry_address):
+    """
+    The complement, and the reason the two groups of settings are separated. Repricing a
+    gate must not invalidate its holders, so an edit that touches only the bond, the
+    stake, the TTL and the cooldown moves neither counter.
+    """
+    gate_id = unique_gate_id("live-reprice")
+    ensure_gate(
+        owner, registry_address, gate_id,
+        title="Repricing Gate",
+        policy_text=CONSUMER_GATE_POLICY,
+        conditions=CONSUMER_GATE_CONDITIONS,
+        allowed_hosts=[EVIDENCE_HOST_REAL],
+        binding_required=False,
+        bond_wei=LIVE_BOND,
+    )
+    before = read_json(owner, registry_address, "get_gate", [gate_id])
+
+    send(
+        owner, registry_address, "update_gate_config",
+        [
+            gate_id, json.dumps([EVIDENCE_HOST_REAL]), "raw", False, True,
+            LIVE_TTL * 2, LIVE_BOND * 2, LIVE_STAKE * 2, 60,
+        ],
+    )
+    after = read_json(owner, registry_address, "get_gate", [gate_id])
+
+    assert int(after["rules_version"]) == int(before["rules_version"])
+    assert int(after["policy_version"]) == int(before["policy_version"])
+    assert after["bond_wei"] == str(LIVE_BOND * 2), "the reprice did take effect"
+    assert int(after["access_ttl_seconds"]) == LIVE_TTL * 2
+
+
+def test_a_published_frame_is_immutable_on_chain(owner, registry_address):
+    """
+    The snapshot a pending application is judged under has to be beyond the owner's
+    reach. After flipping every adjudication-relevant setting the original version pair
+    still reads back byte for byte, and the new pair reads back as the new rules.
+    """
+    gate_id = unique_gate_id("live-frame-immutable")
+    ensure_gate(
+        owner, registry_address, gate_id,
+        title="Immutable Frame Gate",
+        policy_text=CONSUMER_GATE_POLICY,
+        conditions=CONSUMER_GATE_CONDITIONS,
+        allowed_hosts=[EVIDENCE_HOST_REAL],
+        binding_required=False,
+        require_grounded_quotes=True,
+        bond_wei=0,
+        challenge_stake_wei=0,
+    )
+    gate = read_json(owner, registry_address, "get_gate", [gate_id])
+    pv, rv = int(gate["policy_version"]), int(gate["rules_version"])
+
+    original = read_json(owner, registry_address, "get_rules", [gate_id, pv, rv])
+    assert original["binding_required"] is False
+    assert original["require_grounded_quotes"] is True
+    assert original["fetch_mode"] == "raw"
+    assert original["allowed_hosts"] == [EVIDENCE_HOST_REAL]
+
+    send(
+        owner, registry_address, "update_gate_config",
+        [
+            gate_id, json.dumps([EVIDENCE_HOST_ECHO]), "render", True, False,
+            LIVE_TTL, 0, 0, 0,
+        ],
+    )
+
+    assert read_json(owner, registry_address, "get_rules", [gate_id, pv, rv]) == original, (
+        "a published frame was rewritten by the gate owner"
+    )
+    updated = read_json(owner, registry_address, "get_rules", [gate_id, pv, rv + 1])
+    assert updated["binding_required"] is True
+    assert updated["require_grounded_quotes"] is False
+    assert updated["fetch_mode"] == "render"
+    assert updated["allowed_hosts"] == [EVIDENCE_HOST_ECHO]
+
+    assert read(owner, registry_address, "get_rules", [gate_id, 99, 99]) == ""
 
 
 def test_owner_controls_intake_and_can_hand_over_the_gate(owner, other, registry_address):
