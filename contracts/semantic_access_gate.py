@@ -23,7 +23,7 @@ publishes an access policy as natural language conditions stored on chain. Any
 address that wants access submits public evidence URLs plus a bond. GenLayer
 validators independently fetch that evidence and adjudicate whether it satisfies
 every condition in the policy. An approved applicant receives a time limited,
-policy-version-stamped access record. Any other contract reads that record with a
+version-stamped access record. Any other contract reads that record with a
 single call:
 
     gate.view().is_approved(gate_id, applicant) -> bool
@@ -60,9 +60,11 @@ Adjudication runs through gl.vm.run_nondet_unsafe with an explicit leader functi
 and validator function.
 
 Leader:
-  1. Fetches every evidence URL using the gate's pinned fetch mode.
+  1. Fetches every evidence URL using the pinned fetch mode, skipping any URL whose
+     host the frame does not admit.
   2. Runs the deterministic pre-checks in code, not in the model:
-       - address binding: the gate's binding token, which encodes the applicant's
+       - admissibility: every evidence URL must come from a host the frame allows;
+       - address binding: the frame's binding token, which encodes the applicant's
          own address, must appear verbatim in the fetched evidence;
        - retrievability: at least one evidence document must have been retrieved.
      A pre-check failure short-circuits to DENIED with a machine-readable denial
@@ -105,16 +107,48 @@ adjudication with the bond still escrowed. Deterministic fetch failures (401, 40
 404, 410) are not errors; they are evidence that the evidence is unretrievable and
 resolve to DENIED.
 
-Policy versioning
------------------
-Every gate carries a policy_version. Every access record is stamped with the
-version it was adjudicated under. update_policy increments the version, which
-invalidates every outstanding record in O(1): is_approved compares the record's
-stamp with the gate's current version and returns False on mismatch. No mass
-rewrite, no migration, no admin sweep. Holders must re-apply and be re-adjudicated
-against the new standard. An application submitted under an older version is not
-silently judged by the newer one either; it closes as SUPERSEDED with a full bond
-refund, so nobody is judged against a policy they did not see.
+Versioning the eligibility rules
+--------------------------------
+A gate's eligibility rules are not only its prose. Four mechanical settings decide
+who qualifies just as directly as the conditions do: which hosts count as evidence,
+how that evidence is fetched, whether the applicant must prove control of the wallet,
+and whether a claim of compliance must be quotable from the fetched bytes. Relaxing
+the last two removes the only deterministic checks standing between a document and a
+grant, so treating them as mere configuration would hand the gate owner a way to
+manufacture a grant the evidence never earned. They are therefore versioned exactly
+as the policy text is.
+
+Every gate carries two counters:
+
+  policy_version   bumped by update_policy: what the gate requires.
+  rules_version    bumped by update_gate_config, but only when one of the four
+                   adjudication-relevant settings actually changes: how the gate
+                   checks it. Repricing a bond or extending a TTL moves nothing, so
+                   a gate can be repriced without revoking its holders.
+
+Together the pair names one immutable RulesSnapshot, published on registration and on
+every bump and never rewritten afterwards. Applications and access records stamp the
+pair they were filed and granted under, and three things follow in O(1):
+
+  Existing grants are invalidated when either version moves. is_approved compares
+  both stamps against the gate's current pair and returns False on mismatch. No mass
+  rewrite, no migration, no admin sweep: holders must re-apply and be re-adjudicated
+  against the new standard, whether the owner rewrote the policy or changed the way
+  it is checked. access_status distinguishes POLICY_SUPERSEDED from RULES_SUPERSEDED
+  so a consumer can tell a user which one happened.
+
+  Pending applications cannot be judged under rules that moved. Adjudication reads
+  the frame from the snapshot the application stamped, never from the live gate, and
+  closes the application as SUPERSEDED with a full bond refund if the gate has moved
+  past either version. The owner has no write path to a published snapshot, so there
+  is no sequence of owner actions that judges a posted bond under rules it did not
+  agree to - in either direction: no tightening to seize an honest applicant's bond,
+  and no relaxing to let unqualified evidence through.
+
+  Open challenges are not settled under rules that moved. A challenge pins the record
+  and the version pair it was filed against; if any of the three has moved by the time
+  it resolves it closes as VOID with the stake returned in full, because neither the
+  holder's deposit nor the challenger's stake was posted against the new frame.
 
 Crypto-economics
 ----------------
@@ -123,7 +157,14 @@ The bond does three jobs and is fully accounted for at every step.
   apply_for_access  escrows bond_wei with the application.
   DENIED            the bond is slashed to the gate treasury. Spam costs money.
   GRANTED           the bond converts into the access record's stake and stays
-                    locked for the life of the record.
+                    locked for the life of the record. If the holder already had a
+                    record in that slot - lapsed by expiry, or invalidated by a
+                    version bump, and so still holding its own deposit - that record
+                    is closed, archived and its deposit refunded in the same
+                    transaction. A record slot holds one record, so a renewal must
+                    replace it; settling first is what keeps the replaced deposit
+                    from being stranded inside total_locked_wei with nothing left
+                    able to reach it.
   release_access    returns the stake to the holder and surrenders the access.
   challenge_access  anyone stakes an equal bond to force re-adjudication of a live
                     record against the current policy.
@@ -131,6 +172,9 @@ The bond does three jobs and is fully accounted for at every step.
                                the holder's stake is paid to the challenger.
                       rejected (re-adjudication grants) the challenger's bond is
                                paid to the holder as compensation.
+                      void     (the gate's rules moved, or the record was replaced,
+                               while the challenge was open) the stake is returned
+                               and nobody is slashed.
   revoke_access     the gate owner can revoke, but the stake returns to the holder.
                     The owner can deny access and can never profit from doing so.
 
@@ -181,10 +225,17 @@ APP_EXPIRED_UNADJUDICATED = "STALE_REFUNDED"
 ACCESS_ACTIVE = "ACTIVE"
 ACCESS_REVOKED = "REVOKED"
 ACCESS_RELEASED = "RELEASED"
+# A record closed because its own holder was re-granted access. The deposit behind
+# it is refunded in the same transaction, never carried silently into the new record.
+ACCESS_RENEWED = "RENEWED"
 
 CHALLENGE_OPEN = "OPEN"
 CHALLENGE_UPHELD = "UPHELD"
 CHALLENGE_REJECTED = "REJECTED"
+# A challenge that can no longer be decided under the rules it was filed against,
+# because the gate's eligibility frame moved while it was open. The stake is
+# returned in full: a challenger is never slashed by rules they did not file under.
+CHALLENGE_VOID = "VOID"
 
 VERDICT_SATISFIED = "SATISFIED"
 VERDICT_NOT_SATISFIED = "NOT_SATISFIED"
@@ -192,6 +243,7 @@ VERDICT_NOT_SATISFIED = "NOT_SATISFIED"
 DENIAL_NONE = ""
 DENIAL_BINDING = "BINDING_TOKEN_MISSING"
 DENIAL_UNRETRIEVABLE = "EVIDENCE_UNRETRIEVABLE"
+DENIAL_HOST_NOT_ALLOWED = "EVIDENCE_HOST_NOT_ALLOWED"
 DENIAL_CONDITIONS = "CONDITIONS_NOT_SATISFIED"
 DENIAL_DISQUALIFIED = "DISQUALIFIER_PRESENT"
 MALFORMED_ID = "<malformed>"
@@ -377,6 +429,7 @@ def _reduce_decision(
     disqualifier_results: list,
     binding_ok: bool,
     evidence_ok: bool,
+    hosts_ok: bool = True,
 ) -> tuple:
     """
     The consensus-critical reducer. Pure, total, and deterministic.
@@ -392,10 +445,14 @@ def _reduce_decision(
     verdict. That equivalence is the security argument for comparing only the
     decision field across nodes.
     """
-    # Order matters for the reason code, not the outcome. Retrievability is checked
-    # first because the binding token is searched for inside the fetched bytes: with
-    # nothing fetched, "token missing" would be a misleading thing to tell the
-    # applicant when the real fault is a dead link.
+    # Order matters for the reason code, not the outcome. Admissibility comes first:
+    # if a document is not even drawn from a host the adjudicating frame permits, its
+    # contents are not evidence and nothing downstream should be read from it.
+    # Retrievability is checked next because the binding token is searched for inside
+    # the fetched bytes: with nothing fetched, "token missing" would be a misleading
+    # thing to tell the applicant when the real fault is a dead link.
+    if not hosts_ok:
+        return (DECISION_DENIED, DENIAL_HOST_NOT_ALLOWED, [])
     if not evidence_ok:
         return (DECISION_DENIED, DENIAL_UNRETRIEVABLE, [])
     if not binding_ok:
@@ -430,9 +487,16 @@ def _reduce_decision(
     return (DECISION_GRANTED, DENIAL_NONE, [])
 
 
-def _fetch_evidence(urls: list, fetch_mode: str) -> list:
+def _fetch_evidence(urls: list, fetch_mode: str, allowed_hosts: list) -> list:
     """
     Retrieve every evidence document inside the non-deterministic block.
+
+    `allowed_hosts` comes from the frozen rules snapshot the application was filed
+    against, not from the gate's live configuration. A URL outside that allowlist is
+    marked inadmissible and is never fetched, so narrowing a gate's allowlist can
+    never cause a node to read a document the adjudicating frame did not permit.
+    Admissibility is decided in deterministic code from the snapshot, so leader and
+    validators always agree on it.
 
     Status handling is what makes consensus stable:
       2xx                     retrievable
@@ -446,6 +510,19 @@ def _fetch_evidence(urls: list, fetch_mode: str) -> list:
     documents = []
     for raw_url in urls:
         url = str(raw_url)
+
+        if not _host_allowed(_host_of(url), allowed_hosts):
+            documents.append(
+                {
+                    "url": url,
+                    "status": 0,
+                    "retrievable": False,
+                    "admissible": False,
+                    "text": "",
+                }
+            )
+            continue
+
         if fetch_mode == FETCH_RENDER:
             try:
                 rendered = gl.nondet.web.render(url, mode="text")
@@ -459,6 +536,7 @@ def _fetch_evidence(urls: list, fetch_mode: str) -> list:
                     "url": url,
                     "status": 200,
                     "retrievable": len(text.strip()) > 0,
+                    "admissible": True,
                     "text": text,
                 }
             )
@@ -489,6 +567,7 @@ def _fetch_evidence(urls: list, fetch_mode: str) -> list:
                 "url": url,
                 "status": status,
                 "retrievable": retrievable,
+                "admissible": True,
                 "text": text if retrievable else "",
             }
         )
@@ -529,6 +608,15 @@ def _build_prompt(spec: dict, documents: list) -> str:
                 + str(doc["status"])
                 + ") ===\n"
                 + str(doc["text"])
+            )
+        elif not doc.get("admissible", True):
+            evidence_blocks.append(
+                "=== EVIDENCE DOCUMENT "
+                + str(index + 1)
+                + " (url: "
+                + str(doc["url"])
+                + ") IS NOT ADMISSIBLE: its host is outside the allowlist this gate"
+                + " adjudicates under, so it was not retrieved ==="
             )
         else:
             evidence_blocks.append(
@@ -598,11 +686,19 @@ def _run_adjudication(spec: dict) -> dict:
     the independent-verification requirement: a validator never inspects the
     leader's answer to decide whether to agree, it forms its own.
     """
-    documents = _fetch_evidence(spec["evidence_urls"], spec["fetch_mode"])
+    documents = _fetch_evidence(
+        spec["evidence_urls"], spec["fetch_mode"], spec["allowed_hosts"]
+    )
 
     combined_raw = "\n".join(doc["text"] for doc in documents if doc["retrievable"])
     combined_normalized = _normalize_text(combined_raw)
     evidence_ok = any(doc["retrievable"] for doc in documents)
+
+    # Deterministic pre-check: every document must be drawn from a host the frozen
+    # frame admits. One inadmissible URL fails the whole set rather than being
+    # quietly dropped, so an applicant can never be judged on a partial evidence
+    # bundle without being told why.
+    hosts_ok = all(doc.get("admissible", True) for doc in documents)
 
     # Deterministic pre-check: proof of address control. Checked in code over the
     # bytes actually fetched, so it cannot be hallucinated or argued around.
@@ -612,31 +708,42 @@ def _run_adjudication(spec: dict) -> dict:
         binding_ok = token.lower() in combined_raw.lower()
 
     evidence_status = [
-        {"url": doc["url"], "status": doc["status"], "retrievable": doc["retrievable"]}
+        {
+            "url": doc["url"],
+            "status": doc["status"],
+            "retrievable": doc["retrievable"],
+            "admissible": bool(doc.get("admissible", True)),
+        }
         for doc in documents
     ]
 
     # Short-circuit: a failed pre-check is already a decision, so skip the model
-    # entirely. This keeps denials for missing binding or dead links cheap and
-    # perfectly reproducible across nodes.
-    if not binding_ok or not evidence_ok:
+    # entirely. This keeps denials for an inadmissible host, a missing binding token
+    # or a dead link cheap and perfectly reproducible across nodes.
+    if not hosts_ok or not binding_ok or not evidence_ok:
         decision, denial_code, failed_ids = _reduce_decision(
-            [], [], binding_ok, evidence_ok
+            [], [], binding_ok, evidence_ok, hosts_ok
         )
+        if not hosts_ok:
+            reasoning = (
+                "One or more evidence URLs are outside the host allowlist this "
+                "application is adjudicated under."
+            )
+        elif not evidence_ok:
+            reasoning = "No evidence document could be retrieved."
+        else:
+            reasoning = "Binding token not found in the fetched evidence."
         return {
             "decision": decision,
             "denial_code": denial_code,
             "failed_ids": failed_ids,
             "binding_ok": binding_ok,
             "evidence_ok": evidence_ok,
+            "hosts_ok": hosts_ok,
             "conditions": [],
             "disqualifiers": [],
             "evidence_status": evidence_status,
-            "reasoning": (
-                "No evidence document could be retrieved."
-                if not evidence_ok
-                else "Binding token not found in the fetched evidence."
-            ),
+            "reasoning": reasoning,
         }
 
     prompt = _build_prompt(spec, documents)
@@ -702,7 +809,7 @@ def _run_adjudication(spec: dict) -> dict:
         )
 
     decision, denial_code, failed_ids = _reduce_decision(
-        condition_results, disqualifier_results, binding_ok, evidence_ok
+        condition_results, disqualifier_results, binding_ok, evidence_ok, hosts_ok
     )
 
     return {
@@ -711,6 +818,7 @@ def _run_adjudication(spec: dict) -> dict:
         "failed_ids": failed_ids,
         "binding_ok": binding_ok,
         "evidence_ok": evidence_ok,
+        "hosts_ok": hosts_ok,
         "conditions": condition_results,
         "disqualifiers": disqualifier_results,
         "evidence_status": evidence_status,
@@ -737,6 +845,7 @@ def _leader_audit_is_consistent(leader_output: dict) -> bool:
         disqualifiers,
         bool(leader_output.get("binding_ok", False)),
         bool(leader_output.get("evidence_ok", False)),
+        bool(leader_output.get("hosts_ok", True)),
     )
     if expected_decision != str(leader_output.get("decision", "")):
         return False
@@ -856,6 +965,38 @@ class Gate:
     total_denied: u32
     total_revoked: u32
     treasury_wei: u256
+    # Version of the adjudication frame: the allowed hosts, the fetch mode, the
+    # wallet binding requirement and the quote grounding requirement. Bumped only
+    # when one of those actually changes, never by an economic-only edit. Paired
+    # with policy_version it identifies exactly one immutable RulesSnapshot.
+    rules_version: u32
+
+
+@allow_storage
+@dataclass
+class RulesSnapshot:
+    """
+    An immutable freeze of everything an adjudication is allowed to read.
+
+    Written once per (policy_version, rules_version) pair and never mutated. Every
+    application stamps the pair it was filed under, and the adjudication loads the
+    frame from here rather than from the live gate. That is what makes it
+    structurally impossible to judge an application under rules the applicant never
+    saw: the bytes the validators prompt over are the bytes that existed when the
+    bond was posted, and the gate owner has no write path to them.
+    """
+
+    gate_id: str
+    policy_version: u32
+    rules_version: u32
+    policy_text: str
+    conditions_json: str
+    disqualifiers_json: str
+    allowed_hosts_json: str
+    fetch_mode: str
+    binding_required: bool
+    require_grounded_quotes: bool
+    created_at: u64
 
 
 @allow_storage
@@ -884,6 +1025,11 @@ class Application:
     reasoning: str
     binding_ok: bool
     evidence_ok: bool
+    # The adjudication frame this bond was posted against. Adjudication loads the
+    # RulesSnapshot for (policy_version, rules_version) and supersedes the
+    # application with a full refund if the gate has moved past either.
+    rules_version: u32
+    hosts_ok: bool
 
 
 @allow_storage
@@ -904,6 +1050,11 @@ class AccessRecord:
     closed_at: u64
     close_reason: str
     challenge_count: u32
+    # Stamped at grant time and compared on every read. A grant is live only while
+    # both the policy and the adjudication frame it was issued under are still the
+    # gate's current ones, so tightening either invalidates every outstanding grant
+    # in O(1) exactly as a policy rewrite does.
+    rules_version: u32
 
 
 @allow_storage
@@ -926,6 +1077,13 @@ class Challenge:
     outcome_decision: str
     outcome_denial_code: str
     outcome_reasoning: str
+    # The exact record and frame this challenge was filed against. Resolution checks
+    # all three and voids with a full stake refund if any has moved, so neither the
+    # holder's deposit nor the challenger's stake can be settled under rules that
+    # changed after the stake was posted.
+    record_application_id: str
+    policy_version: u32
+    rules_version: u32
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +1111,11 @@ class SemanticAccessGate(gl.Contract):
     gate_index: TreeMap[u32, str]
     gate_count: u32
 
+    # Immutable adjudication frames, keyed by gate_id|policy_version|rules_version.
+    # Append only: a new version writes a new entry and old entries are never
+    # rewritten, so the exact rules behind any past grant stay reconstructible.
+    rule_snapshots: TreeMap[str, RulesSnapshot]
+
     # Applications
     applications: TreeMap[str, Application]
     application_count: u64
@@ -968,6 +1131,13 @@ class SemanticAccessGate(gl.Contract):
     gate_holder_count: TreeMap[str, u32]
     gate_holders: TreeMap[str, str]
     gate_holder_seen: TreeMap[str, bool]
+
+    # Archive of superseded access records, keyed by the application that issued
+    # them. A renewal closes and archives the record it replaces instead of writing
+    # over it, so the audit trail of every grant a holder has ever held survives.
+    closed_access: TreeMap[str, AccessRecord]
+    access_history_count: TreeMap[str, u32]
+    access_history: TreeMap[str, str]
 
     # Challenges
     challenges: TreeMap[str, Challenge]
@@ -1026,6 +1196,54 @@ class SemanticAccessGate(gl.Contract):
 
     def _access_key(self, gate_id: str, holder: typing.Any) -> str:
         return gate_id + KEY_SEP + _as_address(holder).as_hex.lower()
+
+    def _rules_key(self, gate_id: str, policy_version: int, rules_version: int) -> str:
+        return (
+            gate_id + KEY_SEP + str(int(policy_version)) + KEY_SEP + str(int(rules_version))
+        )
+
+    def _write_rules_snapshot(self, gate: Gate, now: u64) -> str:
+        """
+        Freeze the gate's current adjudication frame under its current version pair.
+
+        Called on registration and on every version bump. Entries are write-once:
+        the key includes both versions and both only ever increase, so this can
+        never overwrite the frame a pending application or a live grant points at.
+        """
+        key = self._rules_key(
+            str(gate.gate_id), int(gate.policy_version), int(gate.rules_version)
+        )
+        self.rule_snapshots[key] = RulesSnapshot(
+            gate_id=str(gate.gate_id),
+            policy_version=gate.policy_version,
+            rules_version=gate.rules_version,
+            policy_text=str(gate.policy_text),
+            conditions_json=str(gate.conditions_json),
+            disqualifiers_json=str(gate.disqualifiers_json),
+            allowed_hosts_json=str(gate.allowed_hosts_json),
+            fetch_mode=str(gate.fetch_mode),
+            binding_required=bool(gate.binding_required),
+            require_grounded_quotes=bool(gate.require_grounded_quotes),
+            created_at=now,
+        )
+        return key
+
+    def _snapshot_or_raise(
+        self, gate_id: str, policy_version: int, rules_version: int
+    ) -> RulesSnapshot:
+        key = self._rules_key(gate_id, policy_version, rules_version)
+        snapshot = self.rule_snapshots.get(key)
+        self._require(
+            snapshot is not None,
+            f"{ERROR_EXPECTED} No rules snapshot for {key}",
+        )
+        return snapshot
+
+    def _frame_matches(self, gate: Gate, policy_version: int, rules_version: int) -> bool:
+        """Is this version pair still the gate's current adjudication frame?"""
+        return int(gate.policy_version) == int(policy_version) and int(
+            gate.rules_version
+        ) == int(rules_version)
 
     def _parse_json_list(self, raw: str, label: str) -> list:
         try:
@@ -1126,23 +1344,31 @@ class SemanticAccessGate(gl.Contract):
                 urls.append(url)
         return json.dumps(urls)
 
-    def _build_spec(self, gate: Gate, application: Application) -> dict:
+    def _build_spec(self, snapshot: RulesSnapshot, application: Application) -> dict:
         """
         Freeze everything the adjudication needs into a plain dict.
 
+        The frame is read from an immutable RulesSnapshot, not from the live gate.
+        Every field that can change the outcome - the policy text, the conditions,
+        the disqualifiers, the host allowlist, the fetch mode, the wallet binding
+        requirement and the quote grounding requirement - comes from the snapshot the
+        application stamped when its bond was posted. The gate owner has no write
+        path to a published snapshot, so there is no sequence of owner actions that
+        makes a pending application adjudicate under rules it did not agree to.
+
         Nothing here is a storage handle. The dict is what gets captured by the
-        leader and validator closures, so the adjudication runs over an immutable
-        snapshot of the policy version the application was filed against.
+        leader and validator closures.
         """
         return {
-            "policy_text": str(gate.policy_text),
-            "conditions": json.loads(str(gate.conditions_json)),
-            "disqualifiers": json.loads(str(gate.disqualifiers_json)),
-            "fetch_mode": str(gate.fetch_mode),
-            "binding_required": bool(gate.binding_required),
-            "require_grounded_quotes": bool(gate.require_grounded_quotes),
+            "policy_text": str(snapshot.policy_text),
+            "conditions": json.loads(str(snapshot.conditions_json)),
+            "disqualifiers": json.loads(str(snapshot.disqualifiers_json)),
+            "allowed_hosts": json.loads(str(snapshot.allowed_hosts_json)),
+            "fetch_mode": str(snapshot.fetch_mode),
+            "binding_required": bool(snapshot.binding_required),
+            "require_grounded_quotes": bool(snapshot.require_grounded_quotes),
             "binding_token": _binding_token(
-                str(gate.gate_id), application.applicant.as_hex
+                str(snapshot.gate_id), application.applicant.as_hex
             ),
             "evidence_urls": json.loads(str(application.evidence_urls_json)),
             "applicant_note": str(application.applicant_note) or "(none provided)",
@@ -1152,17 +1378,28 @@ class SemanticAccessGate(gl.Contract):
         """
         The whole access check, in one place.
 
-        A record is live only if it is ACTIVE, not expired, and stamped with the
-        gate's current policy version. The version comparison is what makes policy
-        updates invalidate every outstanding grant in O(1): the owner bumps one
-        integer and every record issued under the old text stops reading as live,
-        with no iteration and no migration.
+        A record is live only if it is ACTIVE, not expired, and stamped with both of
+        the gate's current versions: the policy version and the adjudication frame's
+        rules version. The version comparison is what makes a rules change invalidate
+        every outstanding grant in O(1): the owner bumps one integer and every record
+        issued under the old frame stops reading as live, with no iteration and no
+        migration.
+
+        Both versions matter because both decide eligibility. A grant established
+        under a frame that required the applicant to publish a binding token, and to
+        quote the evidence verbatim, says nothing about who qualifies once those
+        requirements are dropped - and narrowing the host allowlist retroactively
+        means the document a grant rests on is no longer one this gate accepts. A
+        rules change is an eligibility change, so it invalidates exactly as a policy
+        rewrite does.
         """
         if str(record.status) != ACCESS_ACTIVE:
             return False
         if int(record.expires_at) <= int(now):
             return False
-        return int(record.policy_version) == int(gate.policy_version)
+        return self._frame_matches(
+            gate, int(record.policy_version), int(record.rules_version)
+        )
 
     def _close_record(
         self, key: str, record: AccessRecord, status: str, reason: str, now: u64
@@ -1171,6 +1408,20 @@ class SemanticAccessGate(gl.Contract):
         record.close_reason = reason[:MAX_NOTE_TEXT]
         record.closed_at = now
         self.access[key] = record
+
+    def _archive_record(self, key: str, record: AccessRecord) -> None:
+        """
+        Copy a closed record into the append-only archive before its slot is reused.
+
+        Access records live at one slot per (gate, holder), so a renewal has to write
+        over the slot. Archiving first means the replaced record is preserved rather
+        than destroyed, keyed by the application that issued it, and remains readable
+        through get_access_history.
+        """
+        self.closed_access[str(record.application_id)] = record
+        seq = int(self.access_history_count.get(key) or 0)
+        self.access_history[key + KEY_SEP + str(seq)] = str(record.application_id)
+        self.access_history_count[key] = u32(seq + 1)
 
     # ------------------------------------------------------------------
     # Gate management
@@ -1314,10 +1565,12 @@ class SemanticAccessGate(gl.Contract):
             total_denied=u32(0),
             total_revoked=u32(0),
             treasury_wei=u256(0),
+            rules_version=u32(1),
         )
 
         self.gate_index[u32(int(self.gate_count))] = gid
         self.gate_count = u32(int(self.gate_count) + 1)
+        self._write_rules_snapshot(self.gates[gid], now)
         return gid
 
     @gl.public.write
@@ -1352,12 +1605,14 @@ class SemanticAccessGate(gl.Contract):
             disqualifiers_json, "disqualifiers_json", MAX_DISQUALIFIERS, False
         )
 
+        now = self._now()
         gate.policy_text = clean_policy
         gate.conditions_json = conditions
         gate.disqualifiers_json = disqualifiers
         gate.policy_version = u32(int(gate.policy_version) + 1)
-        gate.updated_at = self._now()
+        gate.updated_at = now
         self.gates[gate.gate_id] = gate
+        self._write_rules_snapshot(gate, now)
         return gate.policy_version
 
     @gl.public.write
@@ -1374,12 +1629,28 @@ class SemanticAccessGate(gl.Contract):
         reapply_cooldown_seconds: int,
     ) -> u32:
         """
-        Update the mechanical parameters of a gate without changing the policy text.
+        Update a gate's mechanical parameters. Returns the new rules version.
 
-        These settings affect how evidence is retrieved and priced, not what the
-        policy means, so the policy version is deliberately not bumped and existing
-        grants stay live. Changing what the policy requires is update_policy, and
-        that always invalidates.
+        The arguments split into two groups, and the split is the whole point of this
+        method.
+
+        Adjudication-relevant: allowed_hosts_json, fetch_mode, binding_required and
+        require_grounded_quotes. These decide who qualifies. Changing any of them is
+        an eligibility change, so it bumps rules_version, publishes a new immutable
+        frame, invalidates every outstanding grant on the next read, and supersedes
+        every pending application with a full bond refund. It is exactly as
+        consequential as rewriting the policy text, and it is treated exactly the
+        same way.
+
+        Economic and operational: access_ttl_seconds, bond_wei, challenge_stake_wei
+        and reapply_cooldown_seconds. These change what a gate costs and how long a
+        grant lasts, not what it takes to earn one, so they do not bump anything and
+        live grants survive them.
+
+        The version only moves when a value in the first group actually changes.
+        Rewriting a gate's bond therefore cannot be used to churn the frame and
+        invalidate honest holders, and re-submitting an unchanged configuration is a
+        no-op rather than a mass revocation.
         """
         gate = self._gate_or_raise(gate_id.strip().lower())
         self._require_gate_owner(gate)
@@ -1405,7 +1676,20 @@ class SemanticAccessGate(gl.Contract):
             f"{ERROR_EXPECTED} reapply_cooldown_seconds must be 0 to {MAX_COOLDOWN_SECONDS}",
         )
 
-        gate.allowed_hosts_json = self._validate_hosts(allowed_hosts_json)
+        hosts = self._validate_hosts(allowed_hosts_json)
+        now = self._now()
+
+        # Compare against the canonicalized forms that would actually be stored, so
+        # that reordering a host list or recasing a fetch mode is correctly seen as
+        # no change at all.
+        frame_changed = (
+            hosts != str(gate.allowed_hosts_json)
+            or mode != str(gate.fetch_mode)
+            or bool(binding_required) != bool(gate.binding_required)
+            or bool(require_grounded_quotes) != bool(gate.require_grounded_quotes)
+        )
+
+        gate.allowed_hosts_json = hosts
         gate.fetch_mode = mode
         gate.binding_required = bool(binding_required)
         gate.require_grounded_quotes = bool(require_grounded_quotes)
@@ -1413,9 +1697,13 @@ class SemanticAccessGate(gl.Contract):
         gate.bond_wei = u256(int(bond_wei))
         gate.challenge_stake_wei = u256(int(challenge_stake_wei))
         gate.reapply_cooldown_seconds = u64(int(reapply_cooldown_seconds))
-        gate.updated_at = self._now()
+        gate.updated_at = now
+        if frame_changed:
+            gate.rules_version = u32(int(gate.rules_version) + 1)
         self.gates[gate.gate_id] = gate
-        return gate.policy_version
+        if frame_changed:
+            self._write_rules_snapshot(gate, now)
+        return gate.rules_version
 
     @gl.public.write
     def set_gate_paused(self, gate_id: str, paused: bool) -> None:
@@ -1489,9 +1777,12 @@ class SemanticAccessGate(gl.Contract):
         gate with unqualified applications cost money while leaving honest applicants
         whole.
 
-        The application is stamped with the policy version in force right now. If the
-        owner changes the policy before adjudication, the application is closed and
-        fully refunded rather than judged against text the applicant never saw.
+        The application is stamped with both versions in force right now: the policy
+        version and the rules version naming the adjudication frame. Together they
+        pin one immutable RulesSnapshot, which is the only thing the adjudication is
+        allowed to read. If the owner changes either before adjudication, the
+        application is closed and fully refunded rather than judged against rules the
+        applicant never saw.
         """
         gid = gate_id.strip().lower()
         gate = self._gate_or_raise(gid)
@@ -1521,6 +1812,15 @@ class SemanticAccessGate(gl.Contract):
                 f"{ERROR_EXPECTED} Address already holds live access under policy version {int(gate.policy_version)}"
             )
 
+        # A record under challenge cannot be renewed out from under the challenge.
+        # Without this a holder whose record had lapsed could reapply, have the grant
+        # replace the challenged record, and leave the open challenge settling against
+        # a record that no longer exists. Resolve the challenge first.
+        self._require(
+            self.open_challenge.get(holder_key) is None,
+            f"{ERROR_EXPECTED} A challenge is open against this address on this gate; resolve it before applying",
+        )
+
         cooldown = int(gate.reapply_cooldown_seconds)
         if cooldown > 0:
             last_denied = self.last_denied_at.get(holder_key)
@@ -1543,6 +1843,7 @@ class SemanticAccessGate(gl.Contract):
             applicant_note=clean_note,
             bond_wei=u256(sent),
             policy_version=gate.policy_version,
+            rules_version=gate.rules_version,
             status=APP_PENDING,
             created_at=now,
             adjudicated_at=u64(0),
@@ -1555,6 +1856,7 @@ class SemanticAccessGate(gl.Contract):
             reasoning="",
             binding_ok=False,
             evidence_ok=False,
+            hosts_ok=False,
         )
         self.application_count = u64(int(self.application_count) + 1)
         self.open_application[holder_key] = application_id
@@ -1604,20 +1906,40 @@ class SemanticAccessGate(gl.Contract):
         holder_key = self._access_key(str(application.gate_id), application.applicant)
         bond = int(application.bond_wei)
 
-        # Mid-flight policy change: close and refund rather than judge the applicant
-        # against conditions they never agreed to. This keeps the gate honest and
-        # keeps the version stamp meaningful.
-        if int(application.policy_version) != int(gate.policy_version):
+        # Mid-flight rules change: close and refund rather than judge the applicant
+        # against requirements they never agreed to. This covers both halves of the
+        # adjudication frame. A policy rewrite changes what must be established; a
+        # config change to the host allowlist, the fetch mode, the wallet binding
+        # requirement or the quote grounding requirement changes what it takes to
+        # establish it. Either one judged after the fact would let a gate owner move
+        # the bar under a posted bond, in either direction: tightening to seize the
+        # bond of an applicant who qualified, or relaxing to manufacture a grant the
+        # evidence never earned. Neither is possible if the frame cannot move
+        # underneath a pending application.
+        if not self._frame_matches(
+            gate, int(application.policy_version), int(application.rules_version)
+        ):
+            if int(application.policy_version) != int(gate.policy_version):
+                moved = (
+                    "Policy changed from version "
+                    + str(int(application.policy_version))
+                    + " to version "
+                    + str(int(gate.policy_version))
+                )
+            else:
+                moved = (
+                    "Adjudication rules changed from version "
+                    + str(int(application.rules_version))
+                    + " to version "
+                    + str(int(gate.rules_version))
+                )
             application.status = APP_SUPERSEDED
             application.adjudicated_at = now
             application.decision = ""
             application.denial_code = ""
             application.reasoning = (
-                "Policy changed from version "
-                + str(int(application.policy_version))
-                + " to version "
-                + str(int(gate.policy_version))
-                + " before adjudication. Bond refunded in full; reapply under the new policy."
+                moved
+                + " before adjudication. Bond refunded in full; reapply under the new rules."
             )
             self.applications[application_id] = application
             if self.open_application.get(holder_key) is not None:
@@ -1633,12 +1955,21 @@ class SemanticAccessGate(gl.Contract):
                     "status": APP_SUPERSEDED,
                     "decision": "",
                     "refunded_wei": str(bond),
+                    "application_policy_version": int(application.policy_version),
+                    "application_rules_version": int(application.rules_version),
+                    "current_policy_version": int(gate.policy_version),
+                    "current_rules_version": int(gate.rules_version),
                     "reason": str(application.reasoning),
                 },
                 sort_keys=True,
             )
 
-        spec = self._build_spec(gate, application)
+        snapshot = self._snapshot_or_raise(
+            str(application.gate_id),
+            int(application.policy_version),
+            int(application.rules_version),
+        )
+        spec = self._build_spec(snapshot, application)
         result = _adjudicate_with_consensus(spec)
 
         decision = str(result.get("decision", DECISION_DENIED))
@@ -1663,12 +1994,48 @@ class SemanticAccessGate(gl.Contract):
         application.reasoning = str(result.get("reasoning", ""))[:600]
         application.binding_ok = bool(result.get("binding_ok", False))
         application.evidence_ok = bool(result.get("evidence_ok", False))
+        application.hosts_ok = bool(result.get("hosts_ok", True))
 
         if self.open_application.get(holder_key) is not None:
             del self.open_application[holder_key]
 
+        carried_deposit = 0
         if decision == DECISION_GRANTED:
             application.status = APP_GRANTED
+
+            # Renewal settlement. The slot at holder_key holds at most one record, so
+            # a new grant has to replace whatever is there. Anything still ACTIVE at
+            # this point lapsed on its own - it expired, or a policy or rules change
+            # invalidated it - and it is still carrying the deposit that backed it.
+            # Overwriting it would strand that deposit: it would stay inside
+            # total_locked_wei with no record left pointing at it and no method able
+            # to reach it, so the holder's collateral would be destroyed and the
+            # registry's solvency figure would permanently overstate what it can pay
+            # out. Instead the prior record is closed, archived, and its deposit
+            # refunded in this same transaction, with total_locked_wei reduced by
+            # exactly the amount refunded.
+            # A record that was already closed carries no deposit and needs no
+            # settlement, but it is still archived, so the history of a slot is the
+            # whole sequence of grants it has held rather than only the ones that
+            # happened to still be open when they were replaced. It keeps its own
+            # status and close reason: a record the holder released was released, and
+            # relabelling it a renewal would misreport why it ended.
+            prior = self.access.get(holder_key)
+            if prior is not None:
+                if str(prior.status) == ACCESS_ACTIVE:
+                    carried_deposit = int(prior.deposit_wei)
+                    prior.deposit_wei = u256(0)
+                    self._close_record(
+                        holder_key,
+                        prior,
+                        ACCESS_RENEWED,
+                        "Superseded by renewal under application "
+                        + application_id
+                        + "; deposit refunded in full",
+                        now,
+                    )
+                self._archive_record(holder_key, prior)
+
             expires_at = u64(int(now) + int(gate.access_ttl_seconds))
             self.access[holder_key] = AccessRecord(
                 gate_id=str(application.gate_id),
@@ -1682,6 +2049,7 @@ class SemanticAccessGate(gl.Contract):
                 closed_at=u64(0),
                 close_reason="",
                 challenge_count=u32(0),
+                rules_version=gate.rules_version,
             )
             if self.gate_holder_seen.get(holder_key) is None:
                 seq = int(self.gate_holder_count.get(str(application.gate_id)) or 0)
@@ -1703,18 +2071,29 @@ class SemanticAccessGate(gl.Contract):
         self.applications[application_id] = application
         self.gates[str(application.gate_id)] = gate
 
+        if carried_deposit > 0:
+            self.total_locked_wei = u256(
+                int(self.total_locked_wei) - carried_deposit
+            )
+            gl.get_contract_at(application.applicant).emit_transfer(
+                value=u256(carried_deposit), on="finalized"
+            )
+
         return json.dumps(
             {
                 "application_id": application_id,
                 "gate_id": str(application.gate_id),
                 "applicant": application.applicant.as_hex,
                 "policy_version": int(application.policy_version),
+                "rules_version": int(application.rules_version),
                 "status": str(application.status),
                 "decision": decision,
                 "denial_code": str(application.denial_code),
                 "failed_ids": json.loads(str(application.failed_ids_json)),
                 "binding_ok": bool(application.binding_ok),
                 "evidence_ok": bool(application.evidence_ok),
+                "hosts_ok": bool(application.hosts_ok),
+                "refunded_prior_deposit_wei": str(carried_deposit),
                 "conditions": json.loads(str(application.conditions_json)),
                 "disqualifiers": json.loads(str(application.disqualifiers_json)),
                 "evidence_status": json.loads(str(application.evidence_status_json)),
@@ -1966,6 +2345,9 @@ class SemanticAccessGate(gl.Contract):
             outcome_decision="",
             outcome_denial_code="",
             outcome_reasoning="",
+            record_application_id=str(record.application_id),
+            policy_version=record.policy_version,
+            rules_version=record.rules_version,
         )
         self.challenge_count = u64(int(self.challenge_count) + 1)
         self.open_challenge[key] = challenge_id
@@ -1991,6 +2373,13 @@ class SemanticAccessGate(gl.Contract):
         gate treasury takes the other half.
         Rejected (the re-adjudication grants): access stands, the challenger's stake
         is slashed, half compensating the holder and half to the gate treasury.
+        Void: the gate's adjudication frame moved, or the record was replaced, while
+        the challenge was open, so there is no longer a shared set of rules to decide
+        it under. Nobody is slashed, the stake is returned in full, and the record is
+        left exactly as it is - already invalid by version mismatch, with its deposit
+        reclaimable through release_access. A challenge is a staked claim about one
+        record under one frame; neither side agreed to have money settled against a
+        frame published after they posted it.
         """
         challenge = self.challenges.get(challenge_id)
         self._require(
@@ -2012,6 +2401,69 @@ class SemanticAccessGate(gl.Contract):
             f"{ERROR_EXPECTED} Access record for this challenge no longer exists",
         )
 
+        stake = int(challenge.stake_wei)
+
+        frame_held = self._frame_matches(
+            gate, int(challenge.policy_version), int(challenge.rules_version)
+        )
+        record_held = str(record.application_id) == str(challenge.record_application_id)
+
+        if not frame_held or not record_held:
+            if not frame_held:
+                why = (
+                    "The gate moved from policy version "
+                    + str(int(challenge.policy_version))
+                    + " / rules version "
+                    + str(int(challenge.rules_version))
+                    + " to policy version "
+                    + str(int(gate.policy_version))
+                    + " / rules version "
+                    + str(int(gate.rules_version))
+                    + " while this challenge was open"
+                )
+            else:
+                # Unreachable while intake refuses an application from an address with
+                # an open challenge, which is what keeps a record from being replaced
+                # underneath one. Kept so that the invariant fails safe rather than
+                # settling a stake against a record nobody staked against.
+                why = (
+                    "The access record this challenge was filed against ("
+                    + str(challenge.record_application_id)
+                    + ") was replaced by "
+                    + str(record.application_id)
+                )
+            challenge.status = CHALLENGE_VOID
+            challenge.resolved_at = now
+            challenge.outcome_decision = ""
+            challenge.outcome_denial_code = ""
+            challenge.outcome_reasoning = (
+                why
+                + ", so it cannot be decided under the frame it was filed against."
+                + " Stake refunded in full."
+            )
+            self.challenges[challenge_id] = challenge
+            del self.open_challenge[key]
+            self.total_locked_wei = u256(int(self.total_locked_wei) - stake)
+            if stake > 0:
+                gl.get_contract_at(challenge.challenger).emit_transfer(
+                    value=u256(stake), on="finalized"
+                )
+            return json.dumps(
+                {
+                    "challenge_id": challenge_id,
+                    "gate_id": gid,
+                    "status": CHALLENGE_VOID,
+                    "decision": "",
+                    "denial_code": "",
+                    "challenger_payout_wei": str(stake),
+                    "holder_payout_wei": "0",
+                    "treasury_credit_wei": "0",
+                    "access_status": str(record.status),
+                    "reasoning": str(challenge.outcome_reasoning),
+                },
+                sort_keys=True,
+            )
+
         application = self.applications.get(str(record.application_id))
         self._require(
             application is not None,
@@ -2025,7 +2477,10 @@ class SemanticAccessGate(gl.Contract):
             if url not in combined:
                 combined.append(url)
 
-        spec = self._build_spec(gate, application)
+        snapshot = self._snapshot_or_raise(
+            gid, int(challenge.policy_version), int(challenge.rules_version)
+        )
+        spec = self._build_spec(snapshot, application)
         spec["evidence_urls"] = combined
         spec["applicant_note"] = (
             str(application.applicant_note)
@@ -2043,7 +2498,6 @@ class SemanticAccessGate(gl.Contract):
         challenge.outcome_denial_code = str(result.get("denial_code", ""))[:64]
         challenge.outcome_reasoning = str(result.get("reasoning", ""))[:600]
 
-        stake = int(challenge.stake_wei)
         deposit = int(record.deposit_wei)
         payout_challenger = 0
         payout_holder = 0
@@ -2118,9 +2572,10 @@ class SemanticAccessGate(gl.Contract):
         The one call consumer contracts make. Cheap, deterministic, no consensus.
 
         Returns True only when the subject holds an ACTIVE record that has not
-        expired and that carries the gate's current policy version. Adjudication
-        already happened; this is a cached lookup, so any contract can gate a method
-        on a natural language policy for the cost of one cross-contract view.
+        expired and that carries both of the gate's current versions: the policy
+        version and the rules version of the adjudication frame. Adjudication already
+        happened; this is a cached lookup, so any contract can gate a method on a
+        natural language policy for the cost of one cross-contract view.
 
         Integrators: pin (registry address, gate_id) and verify gate ownership once
         at deployment. The gate_id namespace is permissionless by design.
@@ -2139,8 +2594,9 @@ class SemanticAccessGate(gl.Contract):
         The detailed form of is_approved, as JSON.
 
         Use this when a consumer needs to tell a user why they were turned away:
-        no record at all, expired, revoked, or invalidated by a policy update.
-        `reason` is a stable machine readable code.
+        no record at all, expired, revoked, invalidated by a policy update, or
+        invalidated by a change to the adjudication rules. `reason` is a stable
+        machine readable code.
         """
         gid = gate_id.strip().lower()
         subject = _as_address(subject)
@@ -2161,6 +2617,7 @@ class SemanticAccessGate(gl.Contract):
                     "gate_id": gid,
                     "subject": subject.as_hex,
                     "current_policy_version": int(gate.policy_version),
+                    "current_rules_version": int(gate.rules_version),
                 },
                 sort_keys=True,
             )
@@ -2176,6 +2633,8 @@ class SemanticAccessGate(gl.Contract):
             )
         elif int(record.policy_version) != int(gate.policy_version):
             reason = "POLICY_SUPERSEDED"
+        elif int(record.rules_version) != int(gate.rules_version):
+            reason = "RULES_SUPERSEDED"
         elif int(record.expires_at) <= int(now):
             reason = "EXPIRED"
         else:
@@ -2189,7 +2648,9 @@ class SemanticAccessGate(gl.Contract):
                 "subject": subject.as_hex,
                 "record_status": status,
                 "record_policy_version": int(record.policy_version),
+                "record_rules_version": int(record.rules_version),
                 "current_policy_version": int(gate.policy_version),
+                "current_rules_version": int(gate.rules_version),
                 "granted_at": int(record.granted_at),
                 "expires_at": int(record.expires_at),
                 "seconds_remaining": max(0, int(record.expires_at) - int(now)),
@@ -2243,6 +2704,8 @@ class SemanticAccessGate(gl.Contract):
             record = self.access.get(key)
             if record is not None and self._record_is_live(record, gate, now):
                 reason = "ALREADY_APPROVED"
+            elif self.open_challenge.get(key) is not None:
+                reason = "CHALLENGE_OPEN"
             else:
                 cooldown = int(gate.reapply_cooldown_seconds)
                 last_denied = self.last_denied_at.get(key)
@@ -2266,10 +2729,15 @@ class SemanticAccessGate(gl.Contract):
                 "subject": subject.as_hex,
                 "required_bond_wei": str(int(gate.bond_wei)),
                 "policy_version": int(gate.policy_version),
+                "rules_version": int(gate.rules_version),
                 "binding_required": bool(gate.binding_required),
+                "require_grounded_quotes": bool(gate.require_grounded_quotes),
+                "fetch_mode": str(gate.fetch_mode),
+                "allowed_hosts": json.loads(str(gate.allowed_hosts_json)),
                 "binding_token": _binding_token(gid, subject.as_hex),
                 "cooldown_until": cooldown_until,
                 "pending_application_id": self.open_application.get(key) or "",
+                "open_challenge_id": self.open_challenge.get(key) or "",
             },
             sort_keys=True,
         )
@@ -2310,6 +2778,7 @@ class SemanticAccessGate(gl.Contract):
                 "binding_required": bool(gate.binding_required),
                 "require_grounded_quotes": bool(gate.require_grounded_quotes),
                 "policy_version": int(gate.policy_version),
+                "rules_version": int(gate.rules_version),
                 "access_ttl_seconds": int(gate.access_ttl_seconds),
                 "bond_wei": str(int(gate.bond_wei)),
                 "challenge_stake_wei": str(int(gate.challenge_stake_wei)),
@@ -2329,10 +2798,15 @@ class SemanticAccessGate(gl.Contract):
     @gl.public.view
     def get_policy(self, gate_id: str) -> str:
         """
-        The policy exactly as validators see it, plus its version.
+        The whole adjudication frame exactly as validators see it, plus its versions.
 
         This is the object an applicant should read before spending a bond, and the
-        object an auditor should diff after an update_policy call.
+        object an auditor should diff after an update_policy or update_gate_config
+        call. It deliberately includes the mechanical requirements alongside the
+        prose: whether a binding token must be published, whether satisfied
+        conditions must be quoted verbatim, how evidence is fetched and which hosts
+        it may come from all decide who qualifies, so reading the policy text alone
+        is not reading the policy.
         """
         gate = self.gates.get(gate_id.strip().lower())
         if gate is None:
@@ -2341,10 +2815,47 @@ class SemanticAccessGate(gl.Contract):
             {
                 "gate_id": str(gate.gate_id),
                 "policy_version": int(gate.policy_version),
+                "rules_version": int(gate.rules_version),
                 "policy_text": str(gate.policy_text),
                 "conditions": json.loads(str(gate.conditions_json)),
                 "disqualifiers": json.loads(str(gate.disqualifiers_json)),
+                "allowed_hosts": json.loads(str(gate.allowed_hosts_json)),
+                "fetch_mode": str(gate.fetch_mode),
+                "binding_required": bool(gate.binding_required),
+                "require_grounded_quotes": bool(gate.require_grounded_quotes),
                 "updated_at": int(gate.updated_at),
+            },
+            sort_keys=True,
+        )
+
+    @gl.public.view
+    def get_rules(self, gate_id: str, policy_version: int, rules_version: int) -> str:
+        """
+        One historical adjudication frame, exactly as it was published.
+
+        Snapshots are immutable and are never garbage collected, so this answers the
+        question an auditor actually has about a past decision: not "what does this
+        gate require now" but "what did it require when this application was filed".
+        Empty string if that version pair was never published.
+        """
+        snapshot = self.rule_snapshots.get(
+            self._rules_key(gate_id.strip().lower(), policy_version, rules_version)
+        )
+        if snapshot is None:
+            return ""
+        return json.dumps(
+            {
+                "gate_id": str(snapshot.gate_id),
+                "policy_version": int(snapshot.policy_version),
+                "rules_version": int(snapshot.rules_version),
+                "policy_text": str(snapshot.policy_text),
+                "conditions": json.loads(str(snapshot.conditions_json)),
+                "disqualifiers": json.loads(str(snapshot.disqualifiers_json)),
+                "allowed_hosts": json.loads(str(snapshot.allowed_hosts_json)),
+                "fetch_mode": str(snapshot.fetch_mode),
+                "binding_required": bool(snapshot.binding_required),
+                "require_grounded_quotes": bool(snapshot.require_grounded_quotes),
+                "created_at": int(snapshot.created_at),
             },
             sort_keys=True,
         )
@@ -2364,6 +2875,7 @@ class SemanticAccessGate(gl.Contract):
                 "applicant_note": str(application.applicant_note),
                 "bond_wei": str(int(application.bond_wei)),
                 "policy_version": int(application.policy_version),
+                "rules_version": int(application.rules_version),
                 "status": str(application.status),
                 "created_at": int(application.created_at),
                 "adjudicated_at": int(application.adjudicated_at),
@@ -2376,9 +2888,26 @@ class SemanticAccessGate(gl.Contract):
                 "reasoning": str(application.reasoning),
                 "binding_ok": bool(application.binding_ok),
                 "evidence_ok": bool(application.evidence_ok),
+                "hosts_ok": bool(application.hosts_ok),
             },
             sort_keys=True,
         )
+
+    def _record_json(self, record: AccessRecord) -> dict:
+        return {
+            "gate_id": str(record.gate_id),
+            "holder": record.holder.as_hex,
+            "application_id": str(record.application_id),
+            "policy_version": int(record.policy_version),
+            "rules_version": int(record.rules_version),
+            "granted_at": int(record.granted_at),
+            "expires_at": int(record.expires_at),
+            "status": str(record.status),
+            "deposit_wei": str(int(record.deposit_wei)),
+            "closed_at": int(record.closed_at),
+            "close_reason": str(record.close_reason),
+            "challenge_count": int(record.challenge_count),
+        }
 
     @gl.public.view
     def get_access_record(self, gate_id: str, holder: Address) -> str:
@@ -2386,19 +2915,43 @@ class SemanticAccessGate(gl.Contract):
         record = self.access.get(self._access_key(gate_id.strip().lower(), holder))
         if record is None:
             return ""
+        return json.dumps(self._record_json(record), sort_keys=True)
+
+    @gl.public.view
+    def get_access_history(
+        self, gate_id: str, holder: Address, offset: int, limit: int
+    ) -> str:
+        """
+        Every access record this address has previously held on this gate.
+
+        One address can hold access, lapse, and be granted again any number of times,
+        and a record slot holds only the current grant. A renewal archives the record
+        it replaces here rather than destroying it, so the full sequence of grants,
+        the deposit each one carried and the reason each one closed stays auditable.
+        The record currently in the slot is not included; read get_access_record for
+        that one.
+        """
+        gid = gate_id.strip().lower()
+        key = self._access_key(gid, holder)
+        total = int(self.access_history_count.get(key) or 0)
+        start = max(0, int(offset))
+        count = max(0, min(int(limit), 100))
+        records = []
+        index = start
+        while index < total and len(records) < count:
+            app_id = self.access_history.get(key + KEY_SEP + str(index))
+            if app_id is not None:
+                archived = self.closed_access.get(str(app_id))
+                if archived is not None:
+                    records.append(self._record_json(archived))
+            index += 1
         return json.dumps(
             {
-                "gate_id": str(record.gate_id),
-                "holder": record.holder.as_hex,
-                "application_id": str(record.application_id),
-                "policy_version": int(record.policy_version),
-                "granted_at": int(record.granted_at),
-                "expires_at": int(record.expires_at),
-                "status": str(record.status),
-                "deposit_wei": str(int(record.deposit_wei)),
-                "closed_at": int(record.closed_at),
-                "close_reason": str(record.close_reason),
-                "challenge_count": int(record.challenge_count),
+                "gate_id": gid,
+                "holder": _as_address(holder).as_hex,
+                "total": total,
+                "offset": start,
+                "records": records,
             },
             sort_keys=True,
         )
@@ -2421,6 +2974,9 @@ class SemanticAccessGate(gl.Contract):
                 "status": str(challenge.status),
                 "created_at": int(challenge.created_at),
                 "resolved_at": int(challenge.resolved_at),
+                "record_application_id": str(challenge.record_application_id),
+                "policy_version": int(challenge.policy_version),
+                "rules_version": int(challenge.rules_version),
                 "outcome_decision": str(challenge.outcome_decision),
                 "outcome_denial_code": str(challenge.outcome_denial_code),
                 "outcome_reasoning": str(challenge.outcome_reasoning),
@@ -2491,6 +3047,7 @@ class SemanticAccessGate(gl.Contract):
                             "holder": str(raw),
                             "status": str(record.status),
                             "policy_version": int(record.policy_version),
+                            "rules_version": int(record.rules_version),
                             "expires_at": int(record.expires_at),
                             "live": self._record_is_live(record, gate, now),
                         }
@@ -2502,6 +3059,7 @@ class SemanticAccessGate(gl.Contract):
                 "total": total,
                 "offset": start,
                 "current_policy_version": int(gate.policy_version),
+                "current_rules_version": int(gate.rules_version),
                 "holders": holders,
             },
             sort_keys=True,
@@ -2557,6 +3115,7 @@ class SemanticAccessGate(gl.Contract):
                 "gate_id": gid,
                 "owner": gate.owner.as_hex,
                 "policy_version": int(gate.policy_version),
+                "rules_version": int(gate.rules_version),
                 "paused": bool(gate.paused),
                 "total_applications": int(gate.total_applications),
                 "total_granted": int(gate.total_granted),
