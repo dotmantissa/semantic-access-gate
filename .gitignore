@@ -9,3 +9,4 @@ venv/
 .coverage
 htmlcov/
 .gltest-artifacts/
+.task-checklist.md
