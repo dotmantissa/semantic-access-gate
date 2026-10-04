@@ -374,8 +374,13 @@ pytest tests/unit                   # no network required
 pytest tests/direct                 # no network required
 
 export GENLAYER_DEPLOYER_KEY=0x...  # a funded StudioNet account that owns the gates
-pytest tests/live
+pytest tests/live/test_live_registry.py
+pytest tests/live/test_live_consensus.py
 ```
+
+Run the two live files as separate commands. StudioNet rate limits at thirty requests
+per minute and receipt polling consumes that budget quickly, so collecting both at once
+exhausts it and fails fixtures for reasons that have nothing to do with the contract.
 
 The live suite skips entirely when `GENLAYER_DEPLOYER_KEY` is unset. No private key
 appears anywhere in this repository or its history. Fund a StudioNet account with the
